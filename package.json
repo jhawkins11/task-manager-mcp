@@ -1,6 +1,6 @@
 {
   "name": "task-manager-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "index.js",
   "scripts": {
     "build": "tsc",
@@ -14,7 +14,9 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.0",
     "@modelcontextprotocol/sdk": "^1.9.0",
+    "@openrouter/ai-sdk-provider": "^0.4.5",
     "dotenv": "^16.5.0",
+    "openai": "^4.94.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {

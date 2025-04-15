@@ -22,21 +22,27 @@ import {
   GenerativeModel, // Import GenerativeModel type
 } from '@google/generative-ai'
 
+// Import OpenAI SDK for OpenRouter
+import OpenAI from 'openai'
+
 console.error('[TaskServer] LOG: Imports completed.') // Log after imports
 
+// --- User's Logging Setup ---
 const logDir = path.join(__dirname, 'logs')
 const logFile = path.join(logDir, 'debug.log')
 
 async function logToFile(message: string): Promise<void> {
   try {
+    // Ensure log directory exists every time
     await fs.mkdir(logDir, { recursive: true })
     await fs.appendFile(logFile, `${new Date().toISOString()} - ${message}\n`)
   } catch (error) {
-    // Cannot reliably use logToFile here as it might cause infinite loop if logging fails
-    // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
-    console.error('[TaskServer] Error writing to log file:', error)
+    // Fallback to console if file logging fails
+    console.error(`[TaskServer] Error writing to log file (${logFile}):`, error)
+    console.error(`[TaskServer] Original log message: ${message}`)
   }
 }
+// --- End User's Logging Setup ---
 
 // Promisify child_process.exec for easier async/await usage
 const execPromise = util.promisify(exec)
@@ -45,19 +51,38 @@ const execPromise = util.promisify(exec)
 console.error('[TaskServer] LOG: Reading configuration...')
 const TASK_FILE_PATH = path.resolve(__dirname, '.mcp_tasks.json')
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash' // Updated default model
+// Default OpenRouter model - can be overridden via env var
+const OPENROUTER_MODEL =
+  process.env.OPENROUTER_MODEL || 'google/gemini-2.5-pro-exp-03-25:free'
 // Using Gemini API Key for review by default, can be overridden via env var
 const REVIEW_LLM_API_KEY = process.env.REVIEW_LLM_API_KEY || GEMINI_API_KEY
 console.error('[TaskServer] LOG: Configuration read.')
 
-// --- Initialize Google AI SDK ---
+// --- Initialize AI SDKs ---
 console.error('[TaskServer] LOG: Initializing SDK...')
 let genAI: GoogleGenerativeAI | null = null
+let openRouter: OpenAI | null = null
 // Declare models with let to allow reassignment, and type them
 let planningModel: GenerativeModel | undefined
 let reviewModel: GenerativeModel | undefined
 
-if (GEMINI_API_KEY) {
+// Initialize OpenRouter if API key is available
+if (OPENROUTER_API_KEY) {
+  try {
+    openRouter = new OpenAI({
+      apiKey: OPENROUTER_API_KEY,
+      baseURL: 'https://openrouter.ai/api/v1',
+    })
+    console.error('[TaskServer] LOG: OpenRouter SDK initialized successfully.')
+  } catch (sdkError) {
+    console.error(
+      '[TaskServer] CRITICAL ERROR initializing OpenRouter SDK:',
+      sdkError
+    )
+  }
+} else if (GEMINI_API_KEY) {
   try {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY)
     // Configure the model.
@@ -71,13 +96,11 @@ if (GEMINI_API_KEY) {
       '[TaskServer] CRITICAL ERROR initializing Google AI SDK:',
       sdkError
     )
-    // Optionally exit if SDK is critical and failed to init
-    // process.exit(1);
   }
 } else {
   // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
   console.error(
-    '[TaskServer] WARNING: GEMINI_API_KEY environment variable not set. API calls will fail.'
+    '[TaskServer] WARNING: Neither OPENROUTER_API_KEY nor GEMINI_API_KEY environment variable is set. API calls will fail.'
   )
 }
 
@@ -106,6 +129,8 @@ const TaskSchema = z.object({
   id: z.string().uuid(),
   status: z.enum(['pending', 'completed']),
   description: z.string(),
+  complexity: z.enum(['low', 'medium', 'high']).optional(),
+  parentTaskId: z.string().uuid().optional(),
 })
 const TaskListSchema = z.array(TaskSchema)
 type Task = z.infer<typeof TaskSchema>
@@ -113,7 +138,7 @@ type Task = z.infer<typeof TaskSchema>
 // --- Helper Functions ---
 
 async function readTasks(): Promise<Task[]> {
-  // (Keep existing implementation)
+  // (User's implementation preserved)
   try {
     await fs.access(TASK_FILE_PATH)
     const data = await fs.readFile(TASK_FILE_PATH, 'utf-8')
@@ -143,7 +168,7 @@ async function readTasks(): Promise<Task[]> {
 }
 
 async function writeTasks(tasks: Task[]): Promise<void> {
-  // (Keep existing implementation)
+  // (User's implementation preserved)
   try {
     await fs.mkdir(path.dirname(TASK_FILE_PATH), { recursive: true })
     const validatedTasks = TaskListSchema.parse(tasks)
@@ -161,101 +186,342 @@ async function writeTasks(tasks: Task[]): Promise<void> {
 function parseGeminiPlanResponse(
   responseText: string | undefined | null
 ): string[] {
-  // (Keep existing implementation)
+  // Basic parsing
   if (!responseText) {
     return []
   }
-  return responseText
+
+  // Split by newlines and clean up
+  const lines = responseText
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.match(/^[-*+]\s*$/))
-    .map((line) => line.replace(/^[-*+]\s*/, '').replace(/^\d+\.\s*/, ''))
+
+  // Process each line to remove markdown list markers and numbering
+  const cleanedLines = lines.map((line) => {
+    // Remove markdown list markers and numbering
+    return line
+      .replace(/^[-*+]\s*/, '') // Remove list markers like -, *, +
+      .replace(/^\d+\.\s*/, '') // Remove numbered list markers like 1. 2. etc.
+      .replace(/^[a-z]\)\s*/i, '') // Remove lettered list markers like a) b) etc.
+      .replace(/^\([a-z]\)\s*/i, '') // Remove lettered list markers like (a) (b) etc.
+  })
+
+  // Detect hierarchical structure based on indentation or subtask indicators
+  const tasks: string[] = []
+  let currentParentTask: string | null = null
+
+  for (const line of cleanedLines) {
+    // Check if this is a parent task or a subtask based on various indicators
+    const isSubtask =
+      line.match(/subtask|sub-task/i) || // Contains "subtask" or "sub-task"
+      line.startsWith('  ') || // Has leading indentation
+      line.match(/^[a-z]\.[\d]+/i) || // Contains notation like "a.1"
+      line.includes('→') || // Contains arrow indicators
+      line.match(/\([a-z]\)/i) // Contains notation like "(a)"
+
+    if (isSubtask && currentParentTask) {
+      // If it's a subtask and we have a parent, tag it with the parent task info
+      tasks.push(line)
+    } else {
+      // This is a new parent task
+      currentParentTask = line
+      tasks.push(line)
+    }
+  }
+
+  return tasks
 }
 
 /**
- * Extracts the text content from a Gemini API result.
+ * Extracts the text content from an AI API result.
+ * Handles both OpenRouter and Gemini responses.
  */
-function extractTextFromGeminiResponse(
-  result: GenerateContentResult | undefined
+function extractTextFromResponse(
+  result:
+    | GenerateContentResult
+    | OpenAI.Chat.Completions.ChatCompletion
+    | undefined
 ): string | null {
-  // (Keep existing implementation)
-  if (!result) return null
-  try {
-    const response = result.response
-    if (response.promptFeedback?.blockReason) {
-      // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
+  // For OpenRouter responses
+  if (
+    result &&
+    'choices' in result &&
+    result.choices &&
+    result.choices.length > 0
+  ) {
+    const choice = result.choices[0]
+    if (choice.message && choice.message.content) {
+      return choice.message.content
+    }
+    return null
+  }
+
+  // For Gemini responses
+  if (result && 'response' in result) {
+    try {
+      const response = result.response
+      if (response.promptFeedback?.blockReason) {
+        console.error(
+          `[TaskServer] Gemini response blocked: ${response.promptFeedback.blockReason}`
+        )
+        return null
+      }
+      if (response.candidates && response.candidates.length > 0) {
+        const candidate = response.candidates[0]
+        if (candidate.content?.parts?.[0]?.text) {
+          return candidate.content.parts[0].text
+        }
+      }
       console.error(
-        `[TaskServer] Gemini response blocked: ${response.promptFeedback.blockReason}`
+        '[TaskServer] No text content found in Gemini response candidate.'
+      )
+      return null
+    } catch (error) {
+      console.error(
+        '[TaskServer] Error extracting text from Gemini response:',
+        error
       )
       return null
     }
-    if (response.candidates && response.candidates.length > 0) {
-      const candidate = response.candidates[0]
-      if (candidate.content?.parts?.[0]?.text) {
-        return candidate.content.parts[0].text
-      }
-    }
-    // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
-    console.error(
-      '[TaskServer] No text content found in Gemini response candidate.'
-    )
-    return null
-  } catch (error) {
-    // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
-    console.error(
-      '[TaskServer] Error extracting text from Gemini response:',
-      error
-    )
-    return null
   }
+
+  return null
+}
+
+/**
+ * Determines task complexity using an LLM.
+ * Works with both OpenRouter and Gemini models.
+ */
+async function determineTaskComplexity(
+  description: string,
+  model: GenerativeModel | OpenAI | null
+): Promise<'low' | 'medium' | 'high'> {
+  if (!model) {
+    console.error(
+      '[TaskServer] Cannot determine complexity: No model provided.'
+    )
+    // Default to high complexity if no model is available
+    return 'high'
+  }
+
+  const prompt = `
+Task: ${description}
+
+Please analyze this task and determine its complexity level using the following criteria:
+- Low complexity: Quick changes, simple fixes, minor updates, or trivial implementation details.
+- Medium complexity: Features requiring moderate consideration, multi-file changes with clear patterns, or moderate refactoring.
+- High complexity: Major features, architectural changes, complex algorithms, or changes affecting many parts of the codebase.
+
+Provide ONLY ONE of these words as your answer: "low", "medium", or "high".
+`
+
+  try {
+    let result
+    if (model instanceof OpenAI) {
+      // Use OpenRouter
+      result = await model.chat.completions.create({
+        model: OPENROUTER_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        max_tokens: 10,
+      })
+    } else {
+      // Use Gemini
+      result = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 10,
+        },
+        safetySettings,
+      })
+    }
+
+    const resultText = extractTextFromResponse(result)
+
+    if (resultText) {
+      const lowerText = resultText.toLowerCase().trim()
+      if (lowerText.includes('low')) return 'low'
+      if (lowerText.includes('medium')) return 'medium'
+      if (lowerText.includes('high')) return 'high'
+    }
+
+    // Default to high if we couldn't determine (safer)
+    return 'high'
+  } catch (error) {
+    console.error('[TaskServer] Error determining task complexity:', error)
+    return 'high' // Default to high on error (safer)
+  }
+}
+
+/**
+ * Interface for a parent-child task relationship
+ */
+interface TaskRelationship {
+  parentId: string
+  parentDescription: string
+  childIds: string[]
+}
+
+/**
+ * Options for task breakdown
+ */
+interface BreakdownOptions {
+  minSubtasks?: number
+  maxSubtasks?: number
+  preferredComplexity?: 'low' | 'medium'
+}
+
+/**
+ * Breaks down a complex task into subtasks using an LLM.
+ * Works with both OpenRouter and Gemini models.
+ */
+async function breakDownComplexTask(
+  taskDescription: string,
+  parentId: string,
+  model: GenerativeModel | OpenAI | null,
+  options: BreakdownOptions = {}
+): Promise<string[]> {
+  if (!model) {
+    console.error('[TaskServer] Cannot break down task: No model provided.')
+    return []
+  }
+
+  // Use provided options or defaults
+  const {
+    minSubtasks = 3,
+    maxSubtasks = 10,
+    preferredComplexity = 'low',
+  } = options
+
+  // Message for tasks
+  const breakdownPrompt = `
+Break down this complex task into a list of sequential subtasks:
+"${taskDescription}"
+
+Guidelines:
+1. Create ${minSubtasks}-${maxSubtasks} subtasks (fewer for simpler tasks, more for complex ones)
+2. Each subtask should be ${preferredComplexity} complexity if possible
+3. Make each subtask self-contained and specific
+4. The subtasks should be sequential, where completing earlier tasks enables later ones
+5. Only include the list of subtasks (numbered 1, 2, 3, etc.) without additional explanations
+`
+
+  try {
+    let breakdownResult
+    if (model instanceof OpenAI) {
+      // Use OpenRouter
+      breakdownResult = await model.chat.completions.create({
+        model: OPENROUTER_MODEL,
+        messages: [{ role: 'user', content: breakdownPrompt }],
+        temperature: 0.5,
+      })
+    } else {
+      // Use Gemini
+      breakdownResult = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: breakdownPrompt }] }],
+        generationConfig: {
+          temperature: 0.5,
+        },
+        safetySettings,
+      })
+    }
+
+    const breakdownText = extractTextFromResponse(breakdownResult)
+
+    if (!breakdownText) {
+      console.error('[TaskServer] No valid breakdown text received from LLM.')
+      return []
+    }
+
+    // Split text by newlines, clean up, and filter out items that don't look like tasks
+    const subtasks = breakdownText
+      .split('\n')
+      .map((line) => {
+        // Remove numbering and leading/trailing whitespace
+        return line.replace(/^[\d]+[\.\)]-?\s*/, '').trim()
+      })
+      .filter(
+        (line) =>
+          // Filter out any empty lines or lines that don't look like tasks
+          line &&
+          line.length > 10 &&
+          !line.match(/^(subtasks|steps|breakdown|tasks|here)/i)
+      )
+
+    return subtasks
+  } catch (error) {
+    console.error('[TaskServer] Error breaking down complex task:', error)
+    return []
+  }
+}
+
+/**
+ * Extracts parent task ID from a task description if present.
+ * @param taskDescription The task description to check
+ * @returns An object with the cleaned description and parentTaskId if found
+ */
+function extractParentTaskId(taskDescription: string): {
+  description: string
+  parentTaskId?: string
+} {
+  const parentTaskMatch = taskDescription.match(/\[parentTask:([a-f0-9-]+)\]$/i)
+
+  if (parentTaskMatch) {
+    // Extract the parent task ID
+    const parentTaskId = parentTaskMatch[1]
+    // Remove the parent task tag from the description
+    const description = taskDescription.replace(
+      /\s*\[parentTask:[a-f0-9-]+\]$/i,
+      ''
+    )
+    return { description, parentTaskId }
+  }
+
+  return { description: taskDescription }
+}
+
+/**
+ * Extracts complexity rating from a task description.
+ * @param taskDescription The task description to check
+ * @returns An object with the cleaned description and complexity
+ */
+function extractComplexity(taskDescription: string): {
+  description: string
+  complexity: 'low' | 'medium' | 'high'
+} {
+  const complexityMatch = taskDescription.match(/^\[(low|medium|high)\]/i)
+
+  if (complexityMatch) {
+    const complexity = complexityMatch[1].toLowerCase() as
+      | 'low'
+      | 'medium'
+      | 'high'
+    // Remove the complexity tag from the description
+    const description = taskDescription.replace(
+      /^\[(low|medium|high)\]\s*/i,
+      ''
+    )
+    return { description, complexity }
+  }
+
+  // Default to medium if no complexity found
+  return { description: taskDescription, complexity: 'medium' }
 }
 
 // --- MCP Server Setup ---
 console.error('[TaskServer] LOG: Setting up MCP Server instance...')
 const server = new McpServer({
   name: 'task-manager-mcp',
-  version: '0.6.2', // Incremented patch version
+  version: '0.6.3', // Incremented patch version
   description:
     'MCP Server using Google AI SDK and repomix for planning and review.',
+  // CORRECTED: Capabilities should only declare support, not define tools here.
   capabilities: {
-    tools: {
-      get_next_task: {
-        description: 'Get the next pending task from the task list.',
-        input_schema: {},
-        output_schema: {
-          type: 'object',
-          properties: {
-            task_id: { type: 'string', description: 'The ID of the task.' },
-            task_description: {
-              type: 'string',
-              description: 'The description of the task.',
-            },
-          },
-        },
-      },
-      mark_task_complete: {
-        description: 'Mark a task as complete.',
-        input_schema: {
-          task_id: { type: 'string', description: 'The ID of the task.' },
-        },
-        output_schema: {},
-      },
-      plan_feature: {
-        description: 'Plan a feature implementation.',
-        input_schema: {
-          feature_description: {
-            type: 'string',
-            description: 'The description of the feature.',
-          },
-        },
-        output_schema: {},
-      },
-      review_changes: {
-        description: 'Review the changes in the codebase.',
-        input_schema: {},
-        output_schema: {},
-      },
-    },
+    tools: { listChanged: false },
+    // resources: {}, // Add later if needed
+    // prompts: {}, // Add later if needed
   },
 })
 console.error('[TaskServer] LOG: MCP Server instance created.')
@@ -267,20 +533,104 @@ console.error('[TaskServer] LOG: Defining tools...')
 server.tool(
   'get_next_task', // name
   {}, // inputSchema shape (empty object for no input)
+  // handler - input type inferred, return type defines output structure
   async ({}) => {
-    // (Keep existing implementation)
     await logToFile('[TaskServer] Handling get_next_task request...')
     const tasks = await readTasks()
-    const nextTask = tasks.find((task) => task.status === 'pending')
-    let message: string
+    const pendingTasks = tasks.filter((task) => task.status === 'pending')
 
-    if (nextTask) {
-      await logToFile(`[TaskServer] Found next task: ${nextTask.id}`)
-      message = `Next pending task (ID: ${nextTask.id}): ${nextTask.description}`
-    } else {
+    if (pendingTasks.length === 0) {
       await logToFile('[TaskServer] No pending tasks found.')
-      message = 'No pending tasks found.'
+      return {
+        content: [{ type: 'text', text: 'No pending tasks found.' }],
+      }
     }
+
+    // Prioritize tasks based on hierarchy and complexity
+    let nextTask: Task | undefined = undefined
+
+    // First, check if there are any tasks without parent dependencies (top-level tasks)
+    const topLevelTasks = pendingTasks.filter((task) => !task.parentTaskId)
+
+    if (topLevelTasks.length > 0) {
+      // Prioritize lower complexity tasks first at the top level
+      const simpleTasks = topLevelTasks.filter(
+        (task) => task.complexity === 'low'
+      )
+      if (simpleTasks.length > 0) {
+        nextTask = simpleTasks[0]
+      } else {
+        // If no simple tasks, take the first medium one or high if no medium exists
+        const mediumTasks = topLevelTasks.filter(
+          (task) => task.complexity === 'medium'
+        )
+        if (mediumTasks.length > 0) {
+          nextTask = mediumTasks[0]
+        } else {
+          nextTask = topLevelTasks[0] // Default to the first top-level task
+        }
+      }
+    } else {
+      // If no top-level tasks remain, check for subtasks
+      // First identify all parent tasks that are completed
+      const completedParentIds = new Set(
+        tasks
+          .filter((task) => task.status === 'completed')
+          .map((task) => task.id)
+      )
+
+      // Find subtasks whose parent is completed
+      const availableSubtasks = pendingTasks.filter(
+        (task) => task.parentTaskId && completedParentIds.has(task.parentTaskId)
+      )
+
+      if (availableSubtasks.length > 0) {
+        // Prioritize by complexity for subtasks too
+        const simpleSubtasks = availableSubtasks.filter(
+          (task) => task.complexity === 'low'
+        )
+        if (simpleSubtasks.length > 0) {
+          nextTask = simpleSubtasks[0]
+        } else {
+          const mediumSubtasks = availableSubtasks.filter(
+            (task) => task.complexity === 'medium'
+          )
+          if (mediumSubtasks.length > 0) {
+            nextTask = mediumSubtasks[0]
+          } else {
+            nextTask = availableSubtasks[0] // Default to the first available subtask
+          }
+        }
+      } else {
+        // As a fallback, just get the first pending task
+        nextTask = pendingTasks[0]
+      }
+    }
+
+    // We now have the next task to work on
+    await logToFile(`[TaskServer] Found next task: ${nextTask.id}`)
+
+    // Include complexity in the message if available
+    const complexityInfo = nextTask.complexity
+      ? ` (Complexity: ${nextTask.complexity})`
+      : ''
+
+    // Include parent info if this is a subtask
+    let parentInfo = ''
+    if (nextTask.parentTaskId) {
+      const parentTask = tasks.find((t) => t.id === nextTask!.parentTaskId)
+      if (parentTask) {
+        const parentDesc =
+          parentTask.description.length > 30
+            ? parentTask.description.substring(0, 30) + '...'
+            : parentTask.description
+        parentInfo = ` (Subtask of: "${parentDesc}")`
+      }
+    }
+
+    // Embed ID, description, complexity, and parent info in the text message
+    const message = `Next pending task (ID: ${nextTask.id})${complexityInfo}${parentInfo}: ${nextTask.description}`
+
     return {
       content: [{ type: 'text', text: message }],
     }
@@ -291,23 +641,32 @@ server.tool(
 server.tool(
   'mark_task_complete', // name
   {
+    // inputSchema shape
     task_id: z.string().uuid({ message: 'Valid task ID (UUID) is required.' }),
   },
+  // handler - input type inferred ({task_id}), return type defines output structure
   async ({ task_id }) => {
-    // (Keep existing implementation)
     await logToFile(
       `[TaskServer] Handling mark_task_complete request for ID: ${task_id}`
     )
     const tasks = await readTasks()
     let taskFound = false
     let alreadyCompleted = false
+    let isSubtask = false
+    let parentTaskId: string | undefined = undefined
 
-    const updatedTasks = tasks.map(async (task) => {
+    // CORRECTED: Removed unnecessary Promise.all, map is synchronous here.
+    const updatedTasks = tasks.map((task) => {
       if (task.id === task_id) {
         taskFound = true
         if (task.status === 'completed') {
-          await logToFile(`[TaskServer] Task ${task_id} already completed.`)
+          // Use console.error directly here as logToFile is async and might complicate flow
+          console.error(`[TaskServer] Task ${task_id} already completed.`)
           alreadyCompleted = true
+        }
+        if (task.parentTaskId) {
+          isSubtask = true
+          parentTaskId = task.parentTaskId
         }
         return { ...task, status: 'completed' as const }
       }
@@ -321,14 +680,47 @@ server.tool(
       await logToFile(`[TaskServer] Task ${task_id} not found.`)
       message = `Error: Task with ID ${task_id} not found.`
       isError = true
+      return { content: [{ type: 'text', text: message }], isError }
     } else if (alreadyCompleted) {
       message = `Task ${task_id} was already marked as complete.`
     } else {
-      const updatedTasksArray = await Promise.all(updatedTasks)
-      await writeTasks(updatedTasksArray)
+      // Check if this is a subtask and if all sibling subtasks are now complete
+      if (isSubtask && parentTaskId) {
+        // Get all subtasks for this parent
+        const siblingTasks = updatedTasks.filter(
+          (task) => task.parentTaskId === parentTaskId
+        )
+        const allSubtasksComplete = siblingTasks.every(
+          (task) => task.status === 'completed'
+        )
+
+        if (allSubtasksComplete) {
+          // Auto-complete the parent task
+          const finalTasks = updatedTasks.map((task) => {
+            if (task.id === parentTaskId) {
+              console.error(
+                `[TaskServer] Auto-completing parent task ${parentTaskId} as all subtasks are complete.`
+              )
+              return { ...task, status: 'completed' as const }
+            }
+            return task
+          })
+
+          await writeTasks(finalTasks)
+          await logToFile(
+            `[TaskServer] Task ${task_id} and parent task marked as complete.`
+          )
+          message = `Task ${task_id} marked as complete. Parent task ${parentTaskId} also auto-completed as all subtasks are now complete.`
+          return { content: [{ type: 'text', text: message }] }
+        }
+      }
+
+      // Pass the correctly mapped array directly
+      await writeTasks(updatedTasks)
       await logToFile(`[TaskServer] Task ${task_id} marked as complete.`)
       message = `Task ${task_id} marked as complete.`
     }
+    // FIXED: Return structure matching SDK examples { content: [...], isError?: boolean }
     return {
       content: [{ type: 'text', text: message }],
       isError: isError,
@@ -340,21 +732,29 @@ server.tool(
 server.tool(
   'plan_feature', // name
   {
+    // inputSchema shape
     feature_description: z.string().min(10, {
       message: 'Feature description must be at least 10 characters.',
     }),
+    project_path: z
+      .string()
+      .describe(
+        'The absolute path to the project directory to scan with repomix. Defaults to current directory if omitted.'
+      ),
   },
-  async ({ feature_description }) => {
-    // (Keep existing implementation)
+  // handler - input type inferred ({feature_description, project_path}), return type defines output structure
+  async ({ feature_description, project_path }) => {
     await logToFile(
-      `[TaskServer] Handling plan_feature request: "${feature_description}"`
+      `[TaskServer] Handling plan_feature request: "${feature_description}" (Path: ${
+        project_path || 'CWD'
+      })`
     )
 
     let message: string
     let isError = false
     let task_count: number | undefined = undefined
 
-    if (!planningModel) {
+    if (!planningModel && !openRouter) {
       await logToFile(
         '[TaskServer] Planning model not initialized (check API key).'
       )
@@ -365,23 +765,39 @@ server.tool(
 
     let codebaseContext = ''
     try {
-      // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
-      console.error(
-        "[TaskServer] Running 'npx repomix --style plain' to gather codebase context..."
-      )
-      const command = 'npx repomix --style plain'
+      const targetDir = project_path || '.'
+      const command = `npx repomix ${targetDir} --style plain` // Add target directory to command
+
+      // Use console.error for synchronous-like logging before async operation
+      console.error(`[TaskServer] Running repomix command: ${command}`)
+      await logToFile(`[TaskServer] Running repomix command: ${command}`)
+
       const { stdout, stderr } = await execPromise(command, {
-        maxBuffer: 10 * 1024 * 1024,
+        maxBuffer: 10 * 1024 * 1024, // Increased buffer size
       })
+
       if (stderr) {
         await logToFile(`[TaskServer] repomix stderr: ${stderr}`)
+        if (stderr.includes('Permission denied')) {
+          message = `Error running repomix: Permission denied scanning directory '${targetDir}'. Check folder permissions.`
+          isError = true
+          return { content: [{ type: 'text', text: message }], isError }
+        }
       }
       if (!stdout) {
         await logToFile('[TaskServer] repomix stdout was empty.')
       }
-      codebaseContext = stdout
+      // read repomix-output.txt
+      const repomixOutput = await fs.readFile(
+        path.join(targetDir, 'repomix-output.txt'),
+        'utf-8'
+      )
+      if (!repomixOutput) {
+        await logToFile('[TaskServer] repomix-output.txt was empty.')
+      }
+      codebaseContext = repomixOutput
       await logToFile(
-        `[TaskServer] repomix context gathered (${codebaseContext.length} chars).`
+        `[TaskServer] repomix context gathered (${codebaseContext.length} chars) for path: ${targetDir}.`
       )
     } catch (error: any) {
       await logToFile(`[TaskServer] Error running repomix: ${error}`)
@@ -389,6 +805,8 @@ server.tool(
       if (error.message && error.message.includes('command not found')) {
         errorMessage =
           "Error: 'npx' or 'repomix' command not found. Make sure Node.js and repomix are installed and in the PATH."
+      } else if (error.stderr && error.stderr.includes('Permission denied')) {
+        errorMessage = `Error running repomix: Permission denied scanning directory. Check folder permissions.`
       }
       message = errorMessage
       isError = true
@@ -396,30 +814,50 @@ server.tool(
     }
 
     let planSteps: string[] = []
+    let highComplexityTasks: string[] = []
+    let complexTaskMap = new Map<string, string>()
+
     try {
       await logToFile('[TaskServer] Calling Gemini API for planning...')
-      const prompt = `Based on the following codebase context:\n\`\`\`\n${codebaseContext}\n\`\`\`\n\nGenerate a detailed, step-by-step implementation plan for the feature: "${feature_description}". Provide each step as a separate item on a new line. Do not use markdown list markers (like -, *, +).`
-      const MAX_PROMPT_LENGTH = Infinity // Removing truncation for now, let API handle if needed
+      const prompt = `Based on the following codebase context:\n\`\`\`\n${codebaseContext}\n\`\`\`\n\nGenerate a detailed, step-by-step implementation plan for the feature: "${feature_description}". 
+
+For each task, you MUST include a complexity rating (low, medium, or high) in square brackets at the beginning of each task description. Example: "[medium] Update the database schema to include new fields".
+
+Carefully consider the complexity of each task based on:
+1. Time required to implement
+2. Technical difficulty
+3. Dependencies on other components
+4. Risk of introducing bugs
+
+Low complexity: Simple, straightforward tasks that can be completed quickly with minimal risk.
+Medium complexity: Tasks requiring moderate effort, with some dependencies or technical challenges.
+High complexity: Tasks that are time-consuming, technically challenging, or impact critical system components.
+
+Provide each step as a separate item on a new line. Do not use markdown list markers (like -, *, +).`
+      const MAX_PROMPT_LENGTH = Infinity // Removing truncation for now
       const truncatedPrompt =
         prompt.length > MAX_PROMPT_LENGTH
           ? prompt.substring(0, MAX_PROMPT_LENGTH) + '\n\n[CONTEXT TRUNCATED]'
           : prompt
       if (prompt.length > MAX_PROMPT_LENGTH) {
-        // Keep console.warn for potential developer visibility - Reverted decision, changing to logToFile - Reverted again for linting
-        // await logToFile(
-        //      `[TaskServer] WARNING: Prompt truncated to ${MAX_PROMPT_LENGTH} characters for Gemini API.`
-        // )
         console.warn(
+          // Keep console.warn for developer visibility
           `[TaskServer] WARNING: Prompt truncated to ${MAX_PROMPT_LENGTH} characters for Gemini API.`
         )
       }
 
-      const result = await planningModel.generateContent({
-        contents: [{ role: 'user', parts: [{ text: truncatedPrompt }] }],
-        safetySettings,
-      })
+      const result = await (openRouter
+        ? openRouter.chat.completions.create({
+            model: OPENROUTER_MODEL,
+            messages: [{ role: 'user', content: truncatedPrompt }],
+            temperature: 0.7,
+          })
+        : planningModel?.generateContent({
+            contents: [{ role: 'user', parts: [{ text: truncatedPrompt }] }],
+            safetySettings,
+          }))
 
-      const responseText = extractTextFromGeminiResponse(result)
+      const responseText = extractTextFromResponse(result)
 
       if (responseText === null) {
         message =
@@ -432,7 +870,106 @@ server.tool(
       await logToFile(
         `[TaskServer] Received plan with ${planSteps.length} steps from Gemini.`
       )
-      // TODO: Implement recursive breakdown logic here if needed
+
+      // Verify and fix complexity ratings for each task
+      const tasksWithoutComplexity = planSteps.filter(
+        (step) => !step.match(/^\[(low|medium|high)\]/i)
+      )
+
+      if (tasksWithoutComplexity.length > 0) {
+        await logToFile(
+          `[TaskServer] Found ${tasksWithoutComplexity.length} tasks without complexity ratings. Determining complexity...`
+        )
+
+        // Process each task without complexity rating
+        const updatedTasks: string[] = []
+
+        for (const task of planSteps) {
+          if (task.match(/^\[(low|medium|high)\]/i)) {
+            // Task already has complexity rating
+            updatedTasks.push(task)
+          } else {
+            // Determine complexity for this task
+            try {
+              const complexity = await determineTaskComplexity(
+                task,
+                openRouter || planningModel || null
+              )
+              updatedTasks.push(`[${complexity}] ${task}`)
+              await logToFile(
+                `[TaskServer] Assigned complexity '${complexity}' to task: "${task.substring(
+                  0,
+                  40
+                )}..."`
+              )
+            } catch (error) {
+              // If complexity determination fails, default to medium
+              updatedTasks.push(`[medium] ${task}`)
+              console.error(
+                `[TaskServer] Error determining complexity for task "${task.substring(
+                  0,
+                  40
+                )}...":`,
+                error
+              )
+            }
+          }
+        }
+
+        // Replace original tasks with complexity-rated ones
+        planSteps = updatedTasks
+        await logToFile(
+          `[TaskServer] Successfully added complexity ratings to all tasks.`
+        )
+      }
+
+      // Process highly complex tasks recursively
+      highComplexityTasks = []
+      for (const step of planSteps) {
+        const complexityMatch = step.match(/^\[(low|medium|high)\]/i)
+        if (complexityMatch && complexityMatch[1].toLowerCase() === 'high') {
+          highComplexityTasks.push(step)
+        }
+      }
+
+      // Store parent task IDs for later use with subtasks
+      const parentTaskIds = new Map<string, string>()
+      let breakdownSuccesses = 0
+      let breakdownFailures = 0
+
+      for (const complexTask of highComplexityTasks) {
+        const taskDescription = complexTask.replace(/^\[high\]\s*/i, '')
+        // Generate a UUID for this parent task
+        const parentId = crypto.randomUUID()
+        // Store the mapping of task description to ID
+        parentTaskIds.set(taskDescription, parentId)
+
+        // Use the helper function to break down complex tasks
+        const subtasks = await breakDownComplexTask(
+          taskDescription,
+          parentId,
+          openRouter || planningModel || null,
+          {
+            minSubtasks: 3,
+            maxSubtasks: 7,
+            preferredComplexity: 'medium',
+          }
+        )
+
+        if (subtasks.length > 0) {
+          // Remove the original task from planSteps and add subtasks
+          planSteps = planSteps.filter((step) => step !== complexTask)
+          planSteps = [...planSteps, ...subtasks]
+          breakdownSuccesses++
+        } else {
+          breakdownFailures++
+          // Keep the original task if breakdown fails
+        }
+      }
+
+      await logToFile(
+        `[TaskServer] Final plan after breakdown: ${planSteps.length} tasks (${breakdownSuccesses} successful breakdowns, ${breakdownFailures} failures)`
+      )
     } catch (error) {
       // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
       console.error('[TaskServer] Error calling Gemini planning API:', error)
@@ -448,28 +985,110 @@ server.tool(
       return { content: [{ type: 'text', text: message }] }
     }
 
-    const newTasks: Task[] = planSteps.map((description) => ({
-      id: crypto.randomUUID(),
-      status: 'pending',
-      description: description,
-    }))
+    const newTasks: Task[] = planSteps.map((description) => {
+      // Use helper functions to extract complexity and parent task ID
+      const { description: descWithoutParent, parentTaskId } =
+        extractParentTaskId(description)
+      const { description: cleanDescription, complexity } =
+        extractComplexity(descWithoutParent)
+
+      return {
+        id: crypto.randomUUID(),
+        status: 'pending',
+        description: cleanDescription,
+        complexity,
+        ...(parentTaskId && { parentTaskId }),
+      }
+    })
     try {
       await logToFile('[TaskServer] Saving new task plan...')
-      const existingTasks = await readTasks()
+      let existingTasks: Task[] = []
+
+      try {
+        existingTasks = await readTasks()
+      } catch (readError) {
+        await logToFile(
+          `[TaskServer] Error reading existing tasks: ${readError}. Starting with empty task list.`
+        )
+        existingTasks = []
+      }
+
       const completedTasks = existingTasks.filter(
         (task) => task.status === 'completed'
       )
+
+      // Ensure no ID collisions between new tasks and existing completed tasks
+      const existingIds = new Set(completedTasks.map((task) => task.id))
+      let idCollisions = 0
+
+      // Regenerate any IDs that collide with existing tasks
+      newTasks.forEach((task) => {
+        let collisionCount = 0
+        while (existingIds.has(task.id)) {
+          console.error(
+            `[TaskServer] Task ID collision detected, regenerating ID...`
+          )
+          collisionCount++
+          task.id = crypto.randomUUID()
+
+          // Safeguard against infinite loops (though extremely unlikely)
+          if (collisionCount > 5) {
+            console.error(
+              `[TaskServer] Multiple ID collisions encountered (${collisionCount}). Check UUID generation.`
+            )
+            break
+          }
+        }
+
+        if (collisionCount > 0) {
+          idCollisions += collisionCount
+        }
+
+        // Add this ID to our set to avoid collisions between new tasks too
+        existingIds.add(task.id)
+      })
+
+      if (idCollisions > 0) {
+        await logToFile(
+          `[TaskServer] Resolved ${idCollisions} ID collisions when creating new tasks.`
+        )
+      }
+
+      // Ensure parent-child relationships reference valid tasks
+      newTasks.forEach((task) => {
+        if (task.parentTaskId && !existingIds.has(task.parentTaskId)) {
+          // If the parent ID doesn't exist, remove the parent ID reference
+          console.error(
+            `[TaskServer] Task has invalid parentTaskId (${task.parentTaskId}), removing reference.`
+          )
+          task.parentTaskId = undefined
+        }
+      })
+
       const finalTaskList = [...completedTasks, ...newTasks]
-      await writeTasks(finalTaskList)
-      task_count = newTasks.length
-      await logToFile(`[TaskServer] New plan saved with ${task_count} tasks.`)
-      message = `Successfully generated plan with ${task_count} tasks for feature: "${feature_description}"`
-      return { content: [{ type: 'text', text: message }] }
+
+      try {
+        await writeTasks(finalTaskList)
+        task_count = newTasks.length
+        await logToFile(`[TaskServer] New plan saved with ${task_count} tasks.`)
+        message = `Successfully generated plan with ${task_count} tasks for feature: "${feature_description}"`
+      } catch (writeError) {
+        await logToFile(
+          `[TaskServer] Error writing tasks to file: ${writeError}`
+        )
+        message =
+          'Error saving the generated task plan: Task file could not be written.'
+        isError = true
+      }
+
+      // FIXED: Return structure
+      return { content: [{ type: 'text', text: message }], isError }
     } catch (error) {
       // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
       console.error('[TaskServer] Error saving the new task plan:', error)
       message = 'Error saving the generated task plan.'
       isError = true
+      // FIXED: Return structure
       return { content: [{ type: 'text', text: message }], isError }
     }
   }
@@ -479,14 +1098,14 @@ server.tool(
 server.tool(
   'review_changes', // name
   {}, // inputSchema shape (empty object for no input)
+  // handler - input type inferred, return type defines output structure
   async ({}) => {
-    // (Keep existing implementation)
     await logToFile('[TaskServer] Handling review_changes request...')
 
     let message: string
     let isError = false
 
-    if (!reviewModel) {
+    if (!reviewModel && !openRouter) {
       await logToFile(
         '[TaskServer] Review model not initialized (check API key).'
       )
@@ -506,6 +1125,7 @@ server.tool(
       if (!gitDiff.trim()) {
         await logToFile('[TaskServer] No staged changes found.')
         message = 'No staged changes found to review.'
+        // FIXED: Return structure
         return { content: [{ type: 'text', text: message }] }
       }
       await logToFile(
@@ -520,6 +1140,7 @@ server.tool(
         message = 'Error running git diff to get changes.'
       }
       isError = true
+      // FIXED: Return structure
       return { content: [{ type: 'text', text: message }], isError }
     }
 
@@ -528,12 +1149,18 @@ server.tool(
       await logToFile('[TaskServer] Calling Gemini API for review analysis...')
       const prompt = `Review the following code changes (git diff):\n\`\`\`diff\n${gitDiff}\n\`\`\`\n\nProvide concise feedback on correctness, potential issues, style violations, and areas for refactoring. Structure your feedback clearly.`
 
-      const result = await reviewModel.generateContent({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        safetySettings,
-      })
+      const result = await (openRouter
+        ? openRouter.chat.completions.create({
+            model: OPENROUTER_MODEL,
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.5,
+          })
+        : reviewModel?.generateContent({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            safetySettings,
+          }))
 
-      const responseText = extractTextFromGeminiResponse(result)
+      const responseText = extractTextFromResponse(result)
 
       if (responseText === null) {
         message =
@@ -544,12 +1171,14 @@ server.tool(
         message = reviewFeedback // The review itself is the message
         await logToFile('[TaskServer] Received review feedback from Gemini.')
       }
+      // FIXED: Return structure
       return { content: [{ type: 'text', text: message }], isError }
     } catch (error) {
       // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
       console.error('[TaskServer] Error calling Gemini review API:', error)
       message = 'Error occurred during review analysis API call.'
       isError = true
+      // FIXED: Return structure
       return { content: [{ type: 'text', text: message }], isError }
     }
   }
@@ -561,48 +1190,64 @@ async function main() {
   await logToFile('[TaskServer] LOG: main() started.') // Log start of main
   // Load .env file variables - moved earlier, but keep log here
   // dotenv.config(); // Already called at top
-  await logToFile('[TaskServer] LOG: Checking API Key...')
-  // Re-check API key after loading dotenv, in case it wasn't set initially
-  if (!process.env.GEMINI_API_KEY && !genAI) {
+  await logToFile('[TaskServer] LOG: Checking API Keys...')
+
+  // Enhanced initialization check
+  if (!OPENROUTER_API_KEY && !GEMINI_API_KEY && !genAI && !openRouter) {
     await logToFile(
-      '[TaskServer] FATAL: GEMINI_API_KEY environment variable not set. Exiting.'
+      '[TaskServer] FATAL: Neither OPENROUTER_API_KEY nor GEMINI_API_KEY environment variable is set. Exiting.'
     )
     process.exit(1)
-  } else if (!genAI && process.env.GEMINI_API_KEY) {
-    // Check key exists before initializing
-    // Initialize genAI if key was loaded via dotenv but not set initially
-    try {
+  } else if (!genAI && !openRouter && (OPENROUTER_API_KEY || GEMINI_API_KEY)) {
+    await logToFile(
+      '[TaskServer] Attempting to initialize AI SDK with environment variables...'
+    )
+
+    // Try to initialize OpenRouter first
+    if (OPENROUTER_API_KEY) {
+      try {
+        openRouter = new OpenAI({
+          apiKey: OPENROUTER_API_KEY,
+          baseURL: 'https://openrouter.ai/api/v1',
+        })
+        await logToFile('[TaskServer] OpenRouter SDK initialized successfully.')
+      } catch (error) {
+        await logToFile(
+          '[TaskServer] Error initializing OpenRouter SDK:' + error
+        )
+      }
+    }
+
+    // Fall back to Gemini if OpenRouter fails or isn't available
+    if (!openRouter && GEMINI_API_KEY) {
+      try {
+        genAI = new GoogleGenerativeAI(GEMINI_API_KEY)
+        // Re-initialize models if genAI was just created
+        planningModel = genAI.getGenerativeModel({
+          model: GEMINI_MODEL,
+        })
+        reviewModel = genAI.getGenerativeModel({
+          model: GEMINI_MODEL,
+        })
+        await logToFile(
+          '[TaskServer] Google AI SDK initialized using dotenv in main.'
+        )
+      } catch (sdkError) {
+        await logToFile(
+          '[TaskServer] CRITICAL ERROR initializing Google AI SDK in main:' +
+            sdkError
+        )
+        process.exit(1)
+      }
+    } else if (!openRouter && !genAI) {
+      // This case means no API was successfully initialized
       await logToFile(
-        '[TaskServer] LOG: Initializing SDK within main() (API key found)...'
-      )
-      genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
-      // Re-initialize models if genAI was just created
-      planningModel = genAI.getGenerativeModel({
-        model: GEMINI_MODEL,
-      }) // Direct assignment
-      reviewModel = genAI.getGenerativeModel({
-        model: GEMINI_MODEL,
-      }) // Direct assignment
-      await logToFile(
-        '[TaskServer] LOG: Google AI SDK initialized using dotenv in main.'
-      )
-    } catch (sdkError) {
-      // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
-      console.error(
-        '[TaskServer] CRITICAL ERROR initializing Google AI SDK in main:',
-        sdkError
+        '[TaskServer] FATAL: Could not initialize any AI SDK (API Keys likely invalid). Exiting.'
       )
       process.exit(1)
     }
-  } else if (!genAI) {
-    // This case means key was not found initially or by dotenv
-    // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
-    console.error(
-      '[TaskServer] FATAL: Could not initialize Google AI SDK (API Key likely missing). Exiting.'
-    )
-    process.exit(1)
   }
-  await logToFile('[TaskServer] LOG: API Key checked/SDK Initialized.')
+  await logToFile('[TaskServer] LOG: API Keys checked/SDKs Initialized.')
 
   await logToFile('[TaskServer] LOG: Creating transport...')
   const transport = new StdioServerTransport()
@@ -629,10 +1274,18 @@ async function main() {
 process.on('uncaughtException', (error) => {
   // Cannot reliably use async logToFile here
   console.error('[TaskServer] FATAL: Uncaught Exception:', error)
-  fsSync.appendFileSync(
-    logFile,
-    `${new Date().toISOString()} - [TaskServer] FATAL: Uncaught Exception: ${error}\n`
-  )
+  // Use synchronous append for critical errors before exit
+  try {
+    fsSync.mkdirSync(logDir, { recursive: true })
+    fsSync.appendFileSync(
+      logFile,
+      `${new Date().toISOString()} - [TaskServer] FATAL: Uncaught Exception: ${
+        error?.message || error
+      }\n${error?.stack || ''}\n`
+    )
+  } catch (logErr) {
+    console.error('Error writing uncaughtException to sync log:', logErr)
+  }
   process.exit(1)
 })
 
@@ -644,10 +1297,16 @@ process.on('unhandledRejection', (reason, promise) => {
     'reason:',
     reason
   )
-  fsSync.appendFileSync(
-    logFile,
-    `${new Date().toISOString()} - [TaskServer] FATAL: Unhandled Rejection: ${reason}\n`
-  )
+  // Use synchronous append for critical errors before exit
+  try {
+    fsSync.mkdirSync(logDir, { recursive: true })
+    fsSync.appendFileSync(
+      logFile,
+      `${new Date().toISOString()} - [TaskServer] FATAL: Unhandled Rejection: ${reason}\n`
+    )
+  } catch (logErr) {
+    console.error('Error writing unhandledRejection to sync log:', logErr)
+  }
   process.exit(1)
 })
 
@@ -658,9 +1317,17 @@ console.error(
 main().catch((error) => {
   // Cannot reliably use async logToFile here
   console.error('[TaskServer] CRITICAL ERROR executing main():', error)
-  fsSync.appendFileSync(
-    logFile,
-    `${new Date().toISOString()} - [TaskServer] CRITICAL ERROR executing main(): ${error}\n`
-  )
+  // Use synchronous append for critical errors before exit
+  try {
+    fsSync.mkdirSync(logDir, { recursive: true })
+    fsSync.appendFileSync(
+      logFile,
+      `${new Date().toISOString()} - [TaskServer] CRITICAL ERROR executing main(): ${
+        error?.message || error
+      }\n${error?.stack || ''}\n`
+    )
+  } catch (logErr) {
+    console.error('Error writing main() catch to sync log:', logErr)
+  }
   process.exit(1) // Exit if main promise rejects
 })
