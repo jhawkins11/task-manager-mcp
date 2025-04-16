@@ -71,9 +71,8 @@ OPENROUTER_MODEL=google/gemini-2.5-pro-exp-03-25:free
 
 The task manager operates through MCP commands:
 
-- `mcp_plan_feature`: Create a breakdown plan for a new feature
-- `mcp_get_next_task`: Get the next pending task from the plan
-- `mcp_mark_task_complete`: Mark a task as completed
+- `mcp_plan_feature`: Create a breakdown plan for a new feature and returns the first task
+- `mcp_mark_task_complete`: Mark a task as completed and returns the next pending task
 - `mcp_review_changes`: Review code changes using AI
 
 ## License

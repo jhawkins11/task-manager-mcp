@@ -3,7 +3,6 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import * as fsSync from 'fs'
 import { logToFile } from './lib/logger'
-import { handleGetNextTask } from './tools/getNextTask'
 import { handleMarkTaskComplete } from './tools/markTaskComplete'
 import { handlePlanFeature } from './tools/planFeature'
 import { handleReviewChanges } from './tools/reviewChanges'
@@ -28,28 +27,7 @@ console.error('[TaskServer] LOG: MCP Server instance created.')
 // --- Tool Definitions ---
 console.error('[TaskServer] LOG: Defining tools...')
 
-// 1. Tool: get_next_task
-server.tool(
-  'get_next_task',
-  {
-    feature_id: z
-      .string()
-      .uuid({ message: 'Valid feature ID (UUID) is required.' }),
-  },
-  async (args, _extra) => {
-    const result = await handleGetNextTask(args)
-    // Transform the content to match SDK expected format
-    return {
-      content: result.content.map((item) => ({
-        type: item.type as 'text',
-        text: item.text,
-      })),
-      isError: result.isError,
-    }
-  }
-)
-
-// 2. Tool: mark_task_complete
+// 1. Tool: mark_task_complete
 server.tool(
   'mark_task_complete',
   {
@@ -71,7 +49,7 @@ server.tool(
   }
 )
 
-// 3. Tool: plan_feature
+// 2. Tool: plan_feature
 server.tool(
   'plan_feature',
   {
@@ -97,7 +75,7 @@ server.tool(
   }
 )
 
-// 4. Tool: review_changes
+// 3. Tool: review_changes
 server.tool('review_changes', {}, async (_args, _extra) => {
   const result = await handleReviewChanges()
   // Transform the content to match SDK expected format

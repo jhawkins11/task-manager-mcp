@@ -14,7 +14,7 @@ interface MarkTaskCompleteResult {
 }
 
 /**
- * Handles the mark_task_complete tool request
+ * Handles the mark_task_complete tool request and returns the next task
  */
 export async function handleMarkTaskComplete(
   params: MarkTaskCompleteParams
@@ -163,7 +163,8 @@ export async function handleMarkTaskComplete(
             status: 'completed_with_parent',
           })
 
-          return { content: [{ type: 'text', text: message }] }
+          // Now find the next task (using the finalTasks list)
+          return getNextTaskAfterCompletion(finalTasks, message, feature_id)
         }
       }
 
@@ -200,10 +201,9 @@ export async function handleMarkTaskComplete(
         status: 'completed',
       })
     }
-    return {
-      content: [{ type: 'text', text: message }],
-      isError: isError,
-    }
+
+    // Find the next task after completion
+    return getNextTaskAfterCompletion(updatedTasks, message, feature_id)
   } catch (error) {
     const errorMsg = `Error processing mark_task_complete request: ${
       error instanceof Error ? error.message : String(error)
@@ -232,5 +232,76 @@ export async function handleMarkTaskComplete(
       content: [{ type: 'text', text: errorMsg }],
       isError: true,
     }
+  }
+}
+
+/**
+ * Gets the next task after completion and formats the response with both completion message and next task info
+ */
+async function getNextTaskAfterCompletion(
+  tasks: Task[],
+  completionMessage: string,
+  featureId: string
+): Promise<MarkTaskCompleteResult> {
+  // Find the first pending task in the list
+  const nextTask = tasks.find((task) => task.status === 'pending')
+
+  if (!nextTask) {
+    await logToFile(
+      `[TaskServer] No pending tasks remaining for feature ID: ${featureId}`
+    )
+    const message = `${completionMessage}\n\nAll tasks have been completed for this feature.`
+
+    // Record completion in history
+    await addHistoryEntry(featureId, 'tool_response', {
+      tool: 'mark_task_complete',
+      isError: false,
+      message,
+      status: 'all_completed',
+    })
+
+    return {
+      content: [{ type: 'text', text: message }],
+    }
+  }
+
+  // Found the next task
+  await logToFile(`[TaskServer] Found next sequential task: ${nextTask.id}`)
+
+  // Include effort in the message if available
+  const effortInfo = nextTask.effort ? ` (Effort: ${nextTask.effort})` : ''
+
+  // Include parent info if this is a subtask
+  let parentInfo = ''
+  if (nextTask.parentTaskId) {
+    // Find the parent task
+    const parentTask = tasks.find((t) => t.id === nextTask.parentTaskId)
+    if (parentTask) {
+      const parentDesc =
+        parentTask.description.length > 30
+          ? parentTask.description.substring(0, 30) + '...'
+          : parentTask.description
+      parentInfo = ` (Subtask of: "${parentDesc}")`
+    } else {
+      parentInfo = ` (Subtask of parent ID: ${nextTask.parentTaskId})` // Fallback if parent not found
+    }
+  }
+
+  // Embed ID, description, effort, and parent info in the text message
+  const nextTaskMessage = `Next pending task (ID: ${nextTask.id})${effortInfo}${parentInfo}: ${nextTask.description}`
+
+  // Combine completion message with next task info
+  const message = `${completionMessage}\n\n${nextTaskMessage}`
+
+  // Record in history
+  await addHistoryEntry(featureId, 'tool_response', {
+    tool: 'mark_task_complete',
+    isError: false,
+    message,
+    nextTask: nextTask,
+  })
+
+  return {
+    content: [{ type: 'text', text: message }],
   }
 }

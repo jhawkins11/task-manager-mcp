@@ -507,15 +507,49 @@ export async function handlePlanFeature(
         // Don't fail the operation if WebSocket broadcast fails
       }
 
-      // Success message includes the feature ID
+      // Success message includes the feature ID and task count
       message = `Successfully generated plan for feature ID ${featureId} with ${task_count} pending tasks: "${feature_description}"`
 
+      // Find the first pending task to include in the response
+      const firstTask = newTasks.find((task) => task.status === 'pending')
+
+      if (firstTask) {
+        // Include effort in the message if available
+        const effortInfo = firstTask.effort
+          ? ` (Effort: ${firstTask.effort})`
+          : ''
+
+        // Include parent info if this is a subtask
+        let parentInfo = ''
+        if (firstTask.parentTaskId) {
+          // Find the parent task
+          const parentTask = newTasks.find(
+            (t) => t.id === firstTask.parentTaskId
+          )
+          if (parentTask) {
+            const parentDesc =
+              parentTask.description.length > 30
+                ? parentTask.description.substring(0, 30) + '...'
+                : parentTask.description
+            parentInfo = ` (Subtask of: "${parentDesc}")`
+          } else {
+            parentInfo = ` (Subtask of parent ID: ${firstTask.parentTaskId})` // Fallback if parent not found
+          }
+        }
+
+        // Add the first task info to the message
+        const firstTaskMessage = `\n\nNext pending task (ID: ${firstTask.id})${effortInfo}${parentInfo}: ${firstTask.description}`
+        message = message + firstTaskMessage
+      }
+
+      // Record success in history
       await addHistoryEntry(featureId, 'tool_response', {
         tool: 'plan_feature',
         isError: false,
         message,
         featureId: featureId,
         taskCount: task_count,
+        firstTask: firstTask || undefined,
       })
 
       // Return success structure with featureId in the message
