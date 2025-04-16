@@ -129,7 +129,7 @@ const TaskSchema = z.object({
   id: z.string().uuid(),
   status: z.enum(['pending', 'completed']),
   description: z.string(),
-  complexity: z.enum(['low', 'medium', 'high']).optional(),
+  effort: z.enum(['low', 'medium', 'high']).optional(),
   parentTaskId: z.string().uuid().optional(),
 })
 const TaskListSchema = z.array(TaskSchema)
@@ -290,28 +290,28 @@ function extractTextFromResponse(
 }
 
 /**
- * Determines task complexity using an LLM.
+ * Determines task effort using an LLM.
  * Works with both OpenRouter and Gemini models.
  */
-async function determineTaskComplexity(
+async function determineTaskEffort(
   description: string,
   model: GenerativeModel | OpenAI | null
 ): Promise<'low' | 'medium' | 'high'> {
   if (!model) {
-    console.error(
-      '[TaskServer] Cannot determine complexity: No model provided.'
-    )
-    // Default to high complexity if no model is available
-    return 'high'
+    console.error('[TaskServer] Cannot determine effort: No model provided.')
+    // Default to medium effort if no model is available
+    return 'medium' // Changed default to medium
   }
 
   const prompt = `
 Task: ${description}
 
-Please analyze this task and determine its complexity level using the following criteria:
-- Low complexity: Quick changes, simple fixes, minor updates, or trivial implementation details.
-- Medium complexity: Features requiring moderate consideration, multi-file changes with clear patterns, or moderate refactoring.
-- High complexity: Major features, architectural changes, complex algorithms, or changes affecting many parts of the codebase.
+Analyze this **coding task** and determine its estimated **effort level** based ONLY on the implementation work involved. A higher effort level often implies the task might need breaking down into sub-steps. Use these criteria:
+- Low: Simple code changes likely contained in one or a few files, minimal logic changes, straightforward bug fixes. (e.g., renaming a variable, adding a console log, simple UI text change). Expected to be quick.
+- Medium: Requires moderate development time, involves changes across several files or components with clear patterns, includes writing new functions or small classes, moderate refactoring. Might benefit from 1-3 sub-steps. (e.g., adding a new simple API endpoint, implementing a small feature).
+- High: Involves significant development time, potentially spanning multiple days. Suggests complex architectural changes, intricate algorithm implementation, deep refactoring affecting multiple core components, requires careful design and likely needs breakdown into multiple sub-steps (3+). (e.g., redesigning a core system, implementing complex data processing).
+
+Exclude factors like testing procedures, documentation, deployment, or project management overhead.
 
 Provide ONLY ONE of these words as your answer: "low", "medium", or "high".
 `
@@ -347,11 +347,17 @@ Provide ONLY ONE of these words as your answer: "low", "medium", or "high".
       if (lowerText.includes('high')) return 'high'
     }
 
-    // Default to high if we couldn't determine (safer)
-    return 'high'
+    // Default to medium if we couldn't determine
+    console.warn(
+      `[TaskServer] Could not determine effort for "${description.substring(
+        0,
+        50
+      )}...", defaulting to medium. LLM response: ${resultText}`
+    )
+    return 'medium' // Changed default to medium
   } catch (error) {
-    console.error('[TaskServer] Error determining task complexity:', error)
-    return 'high' // Default to high on error (safer)
+    console.error('[TaskServer] Error determining task effort:', error)
+    return 'medium' // Default to medium on error
   }
 }
 
@@ -370,14 +376,14 @@ interface TaskRelationship {
 interface BreakdownOptions {
   minSubtasks?: number
   maxSubtasks?: number
-  preferredComplexity?: 'low' | 'medium'
+  preferredEffort?: 'low' | 'medium'
 }
 
 /**
- * Breaks down a complex task into subtasks using an LLM.
+ * Breaks down a high-effort task into subtasks using an LLM.
  * Works with both OpenRouter and Gemini models.
  */
-async function breakDownComplexTask(
+async function breakDownHighEffortTask(
   taskDescription: string,
   parentId: string,
   model: GenerativeModel | OpenAI | null,
@@ -390,23 +396,14 @@ async function breakDownComplexTask(
 
   // Use provided options or defaults
   const {
-    minSubtasks = 3,
-    maxSubtasks = 10,
-    preferredComplexity = 'low',
+    minSubtasks = 2,
+    maxSubtasks = 5,
+    preferredEffort = 'medium',
   } = options
 
   // Message for tasks
   const breakdownPrompt = `
-Break down this complex task into a list of sequential subtasks:
-"${taskDescription}"
-
-Guidelines:
-1. Create ${minSubtasks}-${maxSubtasks} subtasks (fewer for simpler tasks, more for complex ones)
-2. Each subtask should be ${preferredComplexity} complexity if possible
-3. Make each subtask self-contained and specific
-4. The subtasks should be sequential, where completing earlier tasks enables later ones
-5. Only include the list of subtasks (numbered 1, 2, 3, etc.) without additional explanations
-`
+Break down this high-effort **coding task** into a list of smaller, sequential, actionable coding subtasks:\n"${taskDescription}"\n\nGuidelines:\n1. Create ${minSubtasks}-${maxSubtasks} subtasks.\n2. Each subtask should ideally be 'low' or 'medium' effort, focusing on a specific part of the implementation.\n3. Make each subtask a concrete coding action (e.g., "Create function X", "Refactor module Y", "Add field Z to interface").\n4. The subtasks should represent a logical sequence for implementation.\n5. **Only include the list of coding subtasks** (numbered 1, 2, 3, etc.). Do NOT include explanations, introductions, non-coding steps like testing, deployment, or documentation.\n`
 
   try {
     let breakdownResult
@@ -452,7 +449,7 @@ Guidelines:
 
     return subtasks
   } catch (error) {
-    console.error('[TaskServer] Error breaking down complex task:', error)
+    console.error('[TaskServer] Error breaking down high-effort task:', error)
     return []
   }
 }
@@ -483,31 +480,28 @@ function extractParentTaskId(taskDescription: string): {
 }
 
 /**
- * Extracts complexity rating from a task description.
+ * Extracts effort rating from a task description.
  * @param taskDescription The task description to check
- * @returns An object with the cleaned description and complexity
+ * @returns An object with the cleaned description and effort
  */
-function extractComplexity(taskDescription: string): {
+function extractEffort(taskDescription: string): {
   description: string
-  complexity: 'low' | 'medium' | 'high'
+  effort: 'low' | 'medium' | 'high'
 } {
-  const complexityMatch = taskDescription.match(/^\[(low|medium|high)\]/i)
+  const effortMatch = taskDescription.match(/^\[(low|medium|high)\]/i)
 
-  if (complexityMatch) {
-    const complexity = complexityMatch[1].toLowerCase() as
-      | 'low'
-      | 'medium'
-      | 'high'
-    // Remove the complexity tag from the description
+  if (effortMatch) {
+    const effort = effortMatch[1].toLowerCase() as 'low' | 'medium' | 'high'
+    // Remove the effort tag from the description
     const description = taskDescription.replace(
       /^\[(low|medium|high)\]\s*/i,
       ''
     )
-    return { description, complexity }
+    return { description, effort }
   }
 
-  // Default to medium if no complexity found
-  return { description: taskDescription, complexity: 'medium' }
+  // Default to medium if no effort found
+  return { description: taskDescription, effort: 'medium' }
 }
 
 // --- MCP Server Setup ---
@@ -546,23 +540,21 @@ server.tool(
       }
     }
 
-    // Prioritize tasks based on hierarchy and complexity
+    // Prioritize tasks based on hierarchy and effort
     let nextTask: Task | undefined = undefined
 
     // First, check if there are any tasks without parent dependencies (top-level tasks)
     const topLevelTasks = pendingTasks.filter((task) => !task.parentTaskId)
 
     if (topLevelTasks.length > 0) {
-      // Prioritize lower complexity tasks first at the top level
-      const simpleTasks = topLevelTasks.filter(
-        (task) => task.complexity === 'low'
-      )
+      // Prioritize lower effort tasks first at the top level
+      const simpleTasks = topLevelTasks.filter((task) => task.effort === 'low')
       if (simpleTasks.length > 0) {
         nextTask = simpleTasks[0]
       } else {
         // If no simple tasks, take the first medium one or high if no medium exists
         const mediumTasks = topLevelTasks.filter(
-          (task) => task.complexity === 'medium'
+          (task) => task.effort === 'medium'
         )
         if (mediumTasks.length > 0) {
           nextTask = mediumTasks[0]
@@ -585,15 +577,15 @@ server.tool(
       )
 
       if (availableSubtasks.length > 0) {
-        // Prioritize by complexity for subtasks too
+        // Prioritize by effort for subtasks too
         const simpleSubtasks = availableSubtasks.filter(
-          (task) => task.complexity === 'low'
+          (task) => task.effort === 'low'
         )
         if (simpleSubtasks.length > 0) {
           nextTask = simpleSubtasks[0]
         } else {
           const mediumSubtasks = availableSubtasks.filter(
-            (task) => task.complexity === 'medium'
+            (task) => task.effort === 'medium'
           )
           if (mediumSubtasks.length > 0) {
             nextTask = mediumSubtasks[0]
@@ -610,10 +602,8 @@ server.tool(
     // We now have the next task to work on
     await logToFile(`[TaskServer] Found next task: ${nextTask.id}`)
 
-    // Include complexity in the message if available
-    const complexityInfo = nextTask.complexity
-      ? ` (Complexity: ${nextTask.complexity})`
-      : ''
+    // Include effort in the message if available
+    const effortInfo = nextTask.effort ? ` (Effort: ${nextTask.effort})` : ''
 
     // Include parent info if this is a subtask
     let parentInfo = ''
@@ -628,8 +618,8 @@ server.tool(
       }
     }
 
-    // Embed ID, description, complexity, and parent info in the text message
-    const message = `Next pending task (ID: ${nextTask.id})${complexityInfo}${parentInfo}: ${nextTask.description}`
+    // Embed ID, description, effort, and parent info in the text message
+    const message = `Next pending task (ID: ${nextTask.id})${effortInfo}${parentInfo}: ${nextTask.description}`
 
     return {
       content: [{ type: 'text', text: message }],
@@ -814,26 +804,12 @@ server.tool(
     }
 
     let planSteps: string[] = []
-    let highComplexityTasks: string[] = []
+    let highEffortTasks: string[] = []
     let complexTaskMap = new Map<string, string>()
 
     try {
-      await logToFile('[TaskServer] Calling Gemini API for planning...')
-      const prompt = `Based on the following codebase context:\n\`\`\`\n${codebaseContext}\n\`\`\`\n\nGenerate a detailed, step-by-step implementation plan for the feature: "${feature_description}". 
-
-For each task, you MUST include a complexity rating (low, medium, or high) in square brackets at the beginning of each task description. Example: "[medium] Update the database schema to include new fields".
-
-Carefully consider the complexity of each task based on:
-1. Time required to implement
-2. Technical difficulty
-3. Dependencies on other components
-4. Risk of introducing bugs
-
-Low complexity: Simple, straightforward tasks that can be completed quickly with minimal risk.
-Medium complexity: Tasks requiring moderate effort, with some dependencies or technical challenges.
-High complexity: Tasks that are time-consuming, technically challenging, or impact critical system components.
-
-Provide each step as a separate item on a new line. Do not use markdown list markers (like -, *, +).`
+      await logToFile('[TaskServer] Calling LLM API for planning...')
+      const prompt = `Based on the following codebase context:\n\`\`\`\n${codebaseContext}\n\`\`\`\n\nGenerate a detailed, step-by-step **coding implementation plan** for the feature: \"${feature_description}\".\n\nThe plan should ONLY include actionable tasks a developer needs to perform within the code. Exclude steps related to project management, deployment, manual testing, documentation updates, or obtaining approvals.\n\nFor each **coding task**, you MUST include an **effort rating** (low, medium, or high) in square brackets at the beginning of each task description, based on implementation work involved. High effort tasks often require breakdown. Example: \"[medium] Refactor the user authentication module\".\n\nUse these effort definitions:\n- Low: Simple, quick changes in one or few files, minimal logic changes.\n- Medium: Requires moderate development time, involves changes across several files/components, includes writing new functions/classes. Might need 1-3 sub-steps.\n- High: Significant development time, complex architectural changes, intricate algorithms, deep refactoring. Likely needs multiple sub-steps (3+).\n\nProvide each coding task as a separate item on a new line. Do not use markdown list markers (like -, *, +). Ensure the plan is sequential where applicable.`
       const MAX_PROMPT_LENGTH = Infinity // Removing truncation for now
       const truncatedPrompt =
         prompt.length > MAX_PROMPT_LENGTH
@@ -842,7 +818,7 @@ Provide each step as a separate item on a new line. Do not use markdown list mar
       if (prompt.length > MAX_PROMPT_LENGTH) {
         console.warn(
           // Keep console.warn for developer visibility
-          `[TaskServer] WARNING: Prompt truncated to ${MAX_PROMPT_LENGTH} characters for Gemini API.`
+          `[TaskServer] WARNING: Prompt truncated to ${MAX_PROMPT_LENGTH} characters for LLM API.`
         )
       }
 
@@ -868,45 +844,45 @@ Provide each step as a separate item on a new line. Do not use markdown list mar
 
       planSteps = parseGeminiPlanResponse(responseText)
       await logToFile(
-        `[TaskServer] Received plan with ${planSteps.length} steps from Gemini.`
+        `[TaskServer] Received plan with ${planSteps.length} steps from LLM.`
       )
 
-      // Verify and fix complexity ratings for each task
-      const tasksWithoutComplexity = planSteps.filter(
+      // Verify and fix effort ratings for each task
+      const tasksWithoutEffort = planSteps.filter(
         (step) => !step.match(/^\[(low|medium|high)\]/i)
       )
 
-      if (tasksWithoutComplexity.length > 0) {
+      if (tasksWithoutEffort.length > 0) {
         await logToFile(
-          `[TaskServer] Found ${tasksWithoutComplexity.length} tasks without complexity ratings. Determining complexity...`
+          `[TaskServer] Found ${tasksWithoutEffort.length} tasks without effort ratings. Determining effort...`
         )
 
-        // Process each task without complexity rating
+        // Process each task without effort rating
         const updatedTasks: string[] = []
 
         for (const task of planSteps) {
           if (task.match(/^\[(low|medium|high)\]/i)) {
-            // Task already has complexity rating
+            // Task already has effort rating
             updatedTasks.push(task)
           } else {
-            // Determine complexity for this task
+            // Determine effort for this task
             try {
-              const complexity = await determineTaskComplexity(
+              const effort = await determineTaskEffort(
                 task,
                 openRouter || planningModel || null
               )
-              updatedTasks.push(`[${complexity}] ${task}`)
-              await logToFile(
-                `[TaskServer] Assigned complexity '${complexity}' to task: "${task.substring(
-                  0,
-                  40
-                )}..."`
-              )
+              updatedTasks.push(`[${effort}] ${task}`)
+              // await logToFile( // Reduce log noise slightly
+              //   `[TaskServer] Assigned effort \'${effort}\' to task: \"${task.substring(
+              //     0,
+              //     40
+              //   )}...\"`
+              // )
             } catch (error) {
-              // If complexity determination fails, default to medium
+              // If effort determination fails, default to medium
               updatedTasks.push(`[medium] ${task}`)
               console.error(
-                `[TaskServer] Error determining complexity for task "${task.substring(
+                `[TaskServer] Error determining effort for task \"${task.substring(
                   0,
                   40
                 )}...":`,
@@ -916,19 +892,24 @@ Provide each step as a separate item on a new line. Do not use markdown list mar
           }
         }
 
-        // Replace original tasks with complexity-rated ones
+        // Replace original tasks with effort-rated ones
         planSteps = updatedTasks
         await logToFile(
-          `[TaskServer] Successfully added complexity ratings to all tasks.`
+          `[TaskServer] Successfully added effort ratings to all tasks.`
         )
       }
 
-      // Process highly complex tasks recursively
-      highComplexityTasks = []
+      // Process high-effort tasks recursively
+      highEffortTasks = []
+      const tasksToKeep: string[] = [] // Tasks that are not high effort or failed breakdown
+      complexTaskMap = new Map<string, string>() // Use the existing map
+
       for (const step of planSteps) {
-        const complexityMatch = step.match(/^\[(low|medium|high)\]/i)
-        if (complexityMatch && complexityMatch[1].toLowerCase() === 'high') {
-          highComplexityTasks.push(step)
+        const effortMatch = step.match(/^\[(low|medium|high)\]/i)
+        if (effortMatch && effortMatch[1].toLowerCase() === 'high') {
+          highEffortTasks.push(step)
+        } else {
+          tasksToKeep.push(step) // Keep low and medium tasks
         }
       }
 
@@ -936,43 +917,62 @@ Provide each step as a separate item on a new line. Do not use markdown list mar
       const parentTaskIds = new Map<string, string>()
       let breakdownSuccesses = 0
       let breakdownFailures = 0
+      const allSubtasks: string[] = [] // Collect all generated subtasks
 
-      for (const complexTask of highComplexityTasks) {
+      for (const complexTask of highEffortTasks) {
         const taskDescription = complexTask.replace(/^\[high\]\s*/i, '')
         // Generate a UUID for this parent task
         const parentId = crypto.randomUUID()
-        // Store the mapping of task description to ID
-        parentTaskIds.set(taskDescription, parentId)
+        // Store the mapping of the *original* high-effort task description to its ID
+        complexTaskMap.set(taskDescription, parentId) // Map description to ID for potential use
 
-        // Use the helper function to break down complex tasks
-        const subtasks = await breakDownComplexTask(
+        // Use the helper function to break down high-effort tasks
+        const subtasks = await breakDownHighEffortTask(
           taskDescription,
-          parentId,
+          parentId, // Pass parentId for context if needed by the function internally, though the prompt doesn't explicitly use it
           openRouter || planningModel || null,
           {
-            minSubtasks: 3,
-            maxSubtasks: 7,
-            preferredComplexity: 'medium',
+            minSubtasks: 2, // Adjusted min/max
+            maxSubtasks: 5,
+            preferredEffort: 'medium', // Target medium effort subtasks
           }
         )
 
         if (subtasks.length > 0) {
-          // Remove the original task from planSteps and add subtasks
-          planSteps = planSteps.filter((step) => step !== complexTask)
-          planSteps = [...planSteps, ...subtasks]
+          // Add subtasks, explicitly tagging them with the parent ID
+          const subtasksWithParentId = subtasks.map((subtaskDesc) => {
+            // Re-evaluate effort for subtasks or assign default
+            const { description: cleanSubDesc, effort: subEffort } =
+              extractEffort(subtaskDesc)
+            // If effort wasn't assigned by breakdown, determine it or default
+            const finalEffort = ['low', 'medium', 'high'].includes(subEffort)
+              ? subEffort
+              : 'medium' // Default to medium if breakdown didn't provide valid one
+            return `[${finalEffort}] ${cleanSubDesc} [parentTask:${parentId}]` // Append parent ID tag
+          })
+          allSubtasks.push(...subtasksWithParentId)
+
+          // Add the original high-level task back but mark it as completed automatically,
+          // serving as a parent container
+          tasksToKeep.push(`${complexTask} [parentContainer]`) // Add a marker to identify this later
+
           breakdownSuccesses++
         } else {
+          // Keep the original high-effort task if breakdown fails
+          tasksToKeep.push(complexTask)
           breakdownFailures++
-          // Keep the original task if breakdown fails
         }
       }
 
+      // Combine the kept tasks and the new subtasks
+      planSteps = [...tasksToKeep, ...allSubtasks]
+
       await logToFile(
-        `[TaskServer] Final plan after breakdown: ${planSteps.length} tasks (${breakdownSuccesses} successful breakdowns, ${breakdownFailures} failures)`
+        `[TaskServer] Final plan processing: ${tasksToKeep.length} kept/parent tasks, ${allSubtasks.length} new subtasks (${breakdownSuccesses} successful breakdowns, ${breakdownFailures} failures)`
       )
     } catch (error) {
       // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
-      console.error('[TaskServer] Error calling Gemini planning API:', error)
+      console.error('[TaskServer] Error calling LLM planning API:', error)
       message = 'Error occurred during feature planning API call.'
       isError = true
       return { content: [{ type: 'text', text: message }], isError }
@@ -985,19 +985,22 @@ Provide each step as a separate item on a new line. Do not use markdown list mar
       return { content: [{ type: 'text', text: message }] }
     }
 
-    const newTasks: Task[] = planSteps.map((description) => {
-      // Use helper functions to extract complexity and parent task ID
+    const newTasks: Task[] = planSteps.map((step) => {
+      // Use helper functions to extract effort and parent task ID
+      const isParentContainer = step.includes('[parentContainer]')
+      const descriptionWithTags = step.replace('[parentContainer]', '').trim() // Remove container tag
+
       const { description: descWithoutParent, parentTaskId } =
-        extractParentTaskId(description)
-      const { description: cleanDescription, complexity } =
-        extractComplexity(descWithoutParent)
+        extractParentTaskId(descriptionWithTags) // Extracts [parentTask:...]
+      const { description: cleanDescription, effort } =
+        extractEffort(descWithoutParent) // Extracts [effort]...
 
       return {
-        id: crypto.randomUUID(),
-        status: 'pending',
+        id: complexTaskMap.get(cleanDescription) || crypto.randomUUID(), // Use mapped ID for parent, else new UUID
+        status: isParentContainer ? 'completed' : 'pending', // Mark containers as completed
         description: cleanDescription,
-        complexity,
-        ...(parentTaskId && { parentTaskId }),
+        effort: effort,
+        ...(parentTaskId && { parentTaskId }), // Add parentTaskId if extracted
       }
     })
     try {
@@ -1024,9 +1027,36 @@ Provide each step as a separate item on a new line. Do not use markdown list mar
       // Regenerate any IDs that collide with existing tasks
       newTasks.forEach((task) => {
         let collisionCount = 0
-        while (existingIds.has(task.id)) {
+        // Ensure the parent container tasks get their specific ID if it exists in the map
+        const parentContainerDesc = task.description // Use description before potential modification
+        const mappedParentId = complexTaskMap.get(parentContainerDesc)
+
+        if (task.status === 'completed' && mappedParentId) {
+          // This is a parent container
+          task.id = mappedParentId
+        } else if (task.parentTaskId && !existingIds.has(task.parentTaskId)) {
+          // Check if parent ID exists before assigning it
+          const parentTaskExists =
+            newTasks.some((t) => t.id === task.parentTaskId) ||
+            completedTasks.some((t) => t.id === task.parentTaskId)
+          if (!parentTaskExists) {
+            console.warn(
+              `[TaskServer] Subtask '${task.description.substring(
+                0,
+                30
+              )}...' references non-existent parent ID ${
+                task.parentTaskId
+              }. Removing reference.`
+            )
+            task.parentTaskId = undefined // Remove invalid parent ID
+          }
+        }
+
+        // Handle potential collisions for newly generated IDs
+        while (task.status === 'pending' && existingIds.has(task.id)) {
+          // Only check pending tasks for collisions
           console.error(
-            `[TaskServer] Task ID collision detected, regenerating ID...`
+            `[TaskServer] Task ID collision detected for pending task, regenerating ID...`
           )
           collisionCount++
           task.id = crypto.randomUUID()
@@ -1054,14 +1084,24 @@ Provide each step as a separate item on a new line. Do not use markdown list mar
         )
       }
 
-      // Ensure parent-child relationships reference valid tasks
+      // Ensure parent-child relationships reference valid tasks AFTER ID generation/collision checks
       newTasks.forEach((task) => {
+        // Double check parent references after potential ID regeneration
         if (task.parentTaskId && !existingIds.has(task.parentTaskId)) {
-          // If the parent ID doesn't exist, remove the parent ID reference
-          console.error(
-            `[TaskServer] Task has invalid parentTaskId (${task.parentTaskId}), removing reference.`
-          )
-          task.parentTaskId = undefined
+          const parentTaskExists =
+            newTasks.some((t) => t.id === task.parentTaskId) ||
+            completedTasks.some((t) => t.id === task.parentTaskId)
+          if (!parentTaskExists) {
+            console.warn(
+              `[TaskServer] Task '${task.description.substring(
+                0,
+                30
+              )}...' has invalid parentTaskId (${
+                task.parentTaskId
+              }) after collision checks, removing reference.`
+            )
+            task.parentTaskId = undefined
+          }
         }
       })
 
