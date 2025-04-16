@@ -1,9 +1,15 @@
 import { GenerateContentResult, GenerativeModel } from '@google/generative-ai'
 import OpenAI from 'openai'
-import { BreakdownOptions } from '../models/types'
+import {
+  BreakdownOptions,
+  EffortEstimationSchema,
+  TaskBreakdownSchema,
+  TaskBreakdownResponseSchema,
+} from '../models/types'
 import { aiService } from '../services/aiService'
 import { logToFile } from './logger'
-import { safetySettings } from '../config'
+import { safetySettings, OPENROUTER_MODEL, GEMINI_MODEL } from '../config'
+import { z } from 'zod'
 
 /**
  * Parses the text response from Gemini into a list of tasks.
@@ -60,6 +66,7 @@ export function parseGeminiPlanResponse(
 
 /**
  * Determines task effort using an LLM.
+ * Uses structured JSON output for consistent results.
  * Works with both OpenRouter and Gemini models.
  */
 export async function determineTaskEffort(
@@ -82,48 +89,46 @@ Analyze this **coding task** and determine its estimated **effort level** based 
 
 Exclude factors like testing procedures, documentation, deployment, or project management overhead.
 
-Provide ONLY ONE of these words as your answer: "low", "medium", or "high".
+Respond with a JSON object that includes the effort level and optionally a short reasoning.
 `
 
   try {
-    let result
+    // Use structured response with schema validation
     if (model instanceof OpenAI) {
-      // Use OpenRouter
-      result = await model.chat.completions.create({
-        model: 'google/gemini-2.5-pro-exp-03-25:free',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.1,
-        max_tokens: 10,
-      })
+      // Use OpenRouter with structured output
+      const result = await aiService.callOpenRouterWithSchema(
+        OPENROUTER_MODEL,
+        [{ role: 'user', content: prompt }],
+        EffortEstimationSchema,
+        { temperature: 0.1, max_tokens: 100 }
+      )
+
+      if (result.success) {
+        return result.data.effort
+      } else {
+        console.warn(
+          `[TaskServer] Could not determine effort using structured output: ${result.error}. Defaulting to medium.`
+        )
+        return 'medium'
+      }
     } else {
-      // Use Gemini
-      result = await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 10,
-        },
-        safetySettings,
-      })
+      // Use Gemini with structured output
+      const result = await aiService.callGeminiWithSchema(
+        GEMINI_MODEL,
+        prompt,
+        EffortEstimationSchema,
+        { temperature: 0.1, maxOutputTokens: 100 }
+      )
+
+      if (result.success) {
+        return result.data.effort
+      } else {
+        console.warn(
+          `[TaskServer] Could not determine effort using structured output: ${result.error}. Defaulting to medium.`
+        )
+        return 'medium'
+      }
     }
-
-    const resultText = aiService.extractTextFromResponse(result)
-
-    if (resultText) {
-      const lowerText = resultText.toLowerCase().trim()
-      if (lowerText.includes('low')) return 'low'
-      if (lowerText.includes('medium')) return 'medium'
-      if (lowerText.includes('high')) return 'high'
-    }
-
-    // Default to medium if we couldn't determine
-    console.warn(
-      `[TaskServer] Could not determine effort for "${description.substring(
-        0,
-        50
-      )}...", defaulting to medium. LLM response: ${resultText}`
-    )
-    return 'medium'
   } catch (error) {
     console.error('[TaskServer] Error determining task effort:', error)
     return 'medium' // Default to medium on error
@@ -132,6 +137,7 @@ Provide ONLY ONE of these words as your answer: "low", "medium", or "high".
 
 /**
  * Breaks down a high-effort task into subtasks using an LLM.
+ * Uses structured JSON output for consistent results.
  * Works with both OpenRouter and Gemini models.
  */
 export async function breakDownHighEffortTask(
@@ -154,51 +160,63 @@ export async function breakDownHighEffortTask(
 
   // Message for tasks
   const breakdownPrompt = `
-Break down this high-effort **coding task** into a list of smaller, sequential, actionable coding subtasks:\n"${taskDescription}"\n\nGuidelines:\n1. Create ${minSubtasks}-${maxSubtasks} subtasks.\n2. Each subtask should ideally be 'low' or 'medium' effort, focusing on a specific part of the implementation.\n3. Make each subtask a concrete coding action (e.g., "Create function X", "Refactor module Y", "Add field Z to interface").\n4. The subtasks should represent a logical sequence for implementation.\n5. **Only include the list of coding subtasks** (numbered 1, 2, 3, etc.). Do NOT include explanations, introductions, non-coding steps like testing, deployment, or documentation.\n`
+Break down this high-effort **coding task** into a list of smaller, sequential, actionable coding subtasks:
+
+Task: "${taskDescription}"
+
+Guidelines:
+1. Create ${minSubtasks}-${maxSubtasks} subtasks.
+2. Each subtask should ideally be '${preferredEffort}' effort, focusing on a specific part of the implementation.
+3. Make each subtask a concrete coding action (e.g., "Create function X", "Refactor module Y", "Add field Z to interface").
+4. The subtasks should represent a logical sequence for implementation.
+5. Only include coding tasks, not testing, documentation, or deployment steps.
+
+Respond with a JSON object containing an array of subtasks, each with a description and effort level.
+`
 
   try {
-    let breakdownResult
+    // Use structured response with schema validation
     if (model instanceof OpenAI) {
-      // Use OpenRouter
-      breakdownResult = await model.chat.completions.create({
-        model: 'google/gemini-2.5-pro-exp-03-25:free',
-        messages: [{ role: 'user', content: breakdownPrompt }],
-        temperature: 0.5,
-      })
-    } else {
-      // Use Gemini
-      breakdownResult = await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: breakdownPrompt }] }],
-        generationConfig: {
-          temperature: 0.5,
-        },
-        safetySettings,
-      })
-    }
-
-    const breakdownText = aiService.extractTextFromResponse(breakdownResult)
-
-    if (!breakdownText) {
-      console.error('[TaskServer] No valid breakdown text received from LLM.')
-      return []
-    }
-
-    // Split text by newlines, clean up, and filter out items that don't look like tasks
-    const subtasks = breakdownText
-      .split('\n')
-      .map((line) => {
-        // Remove numbering and leading/trailing whitespace
-        return line.replace(/^[\d]+[\.\)]-?\s*/, '').trim()
-      })
-      .filter(
-        (line) =>
-          // Filter out any empty lines or lines that don't look like tasks
-          line &&
-          line.length > 10 &&
-          !line.match(/^(subtasks|steps|breakdown|tasks|here)/i)
+      // Use OpenRouter with structured output
+      const result = await aiService.callOpenRouterWithSchema(
+        OPENROUTER_MODEL,
+        [{ role: 'user', content: breakdownPrompt }],
+        TaskBreakdownResponseSchema,
+        { temperature: 0.5 }
       )
 
-    return subtasks
+      if (result.success) {
+        // Extract the descriptions from the structured response
+        return result.data.subtasks.map(
+          (subtask) => `[${subtask.effort}] ${subtask.description}`
+        )
+      } else {
+        console.warn(
+          `[TaskServer] Could not break down task using structured output: ${result.error}`
+        )
+        return []
+      }
+    } else {
+      // Use Gemini with structured output
+      const result = await aiService.callGeminiWithSchema(
+        GEMINI_MODEL,
+        breakdownPrompt,
+        TaskBreakdownResponseSchema,
+        { temperature: 0.5 }
+      )
+
+      if (result.success) {
+        // Extract the descriptions from the structured response
+        return result.data.subtasks.map(
+          (subtask) => `[${subtask.effort}] ${subtask.description}`
+        )
+      } else {
+        console.warn(
+          `[TaskServer] Could not break down task using structured output: ${result.error}`
+        )
+        return []
+      }
+    }
   } catch (error) {
     console.error('[TaskServer] Error breaking down high-effort task:', error)
     return []
@@ -253,4 +271,69 @@ export function extractEffort(taskDescription: string): {
 
   // Default to medium if no effort found
   return { description: taskDescription, effort: 'medium' }
+}
+
+/**
+ * Parses and validates a JSON response string against a provided Zod schema.
+ *
+ * @param responseText - The raw JSON string from the LLM response
+ * @param schema - The Zod schema to validate against
+ * @returns An object containing either the validated data or error information
+ */
+export function parseAndValidateJsonResponse<T extends z.ZodType>(
+  responseText: string | null | undefined,
+  schema: T
+):
+  | { success: true; data: z.infer<T> }
+  | { success: false; error: string; rawData: any | null } {
+  // Handle null or empty responses
+  if (!responseText) {
+    return {
+      success: false,
+      error: 'Response text is empty or null',
+      rawData: null,
+    }
+  }
+
+  // Extract JSON from the response if it's wrapped in markdown or other text
+  let jsonString = responseText
+
+  // Look for JSON in markdown code blocks
+  const jsonBlockMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)\s*```/)
+  if (jsonBlockMatch && jsonBlockMatch[1]) {
+    jsonString = jsonBlockMatch[1]
+  }
+
+  // Attempt to parse the JSON
+  let parsedData: any
+  try {
+    parsedData = JSON.parse(jsonString)
+  } catch (parseError) {
+    return {
+      success: false,
+      error: `Failed to parse JSON: ${(parseError as Error).message}`,
+      rawData: responseText,
+    }
+  }
+
+  // Validate against the schema
+  const validationResult = schema.safeParse(parsedData)
+
+  if (validationResult.success) {
+    return {
+      success: true,
+      data: validationResult.data,
+    }
+  } else {
+    // Format Zod errors into a more readable string
+    const formattedErrors = validationResult.error.errors
+      .map((err) => `${err.path.join('.')}: ${err.message}`)
+      .join('; ')
+
+    return {
+      success: false,
+      error: `Schema validation failed: ${formattedErrors}`,
+      rawData: parsedData,
+    }
+  }
 }

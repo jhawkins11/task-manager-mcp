@@ -1,8 +1,13 @@
-import { Task } from '../models/types'
-import { writeTasks, addHistoryEntry } from '../lib/fsUtils'
-import { logToFile } from '../lib/logger'
+import path from 'path'
+import crypto from 'crypto'
+import {
+  Task,
+  PlanFeatureResponseSchema,
+  PlanningOutputSchema,
+  PlanningTaskSchema,
+} from '../models/types'
+import { promisify } from 'util'
 import { aiService } from '../services/aiService'
-import webSocketService from '../services/webSocketService'
 import {
   parseGeminiPlanResponse,
   determineTaskEffort,
@@ -10,16 +15,18 @@ import {
   extractParentTaskId,
   extractEffort,
 } from '../lib/llmUtils'
-import crypto from 'crypto'
-import util from 'util'
-import { exec } from 'child_process'
-import path from 'path'
+import { logToFile } from '../lib/logger'
+import { readTasks, writeTasks, addHistoryEntry } from '../lib/fsUtils'
 import fs from 'fs/promises'
+import { exec } from 'child_process'
 import * as fsSync from 'fs'
 import { encoding_for_model } from 'tiktoken'
+import webSocketService from '../services/webSocketService'
+import { z } from 'zod'
+import { GEMINI_MODEL, OPENROUTER_MODEL } from '../config'
 
 // Promisify child_process.exec for easier async/await usage
-const execPromise = util.promisify(exec)
+const execPromise = promisify(exec)
 
 interface PlanFeatureParams {
   feature_description: string
@@ -296,20 +303,108 @@ export async function handlePlanFeature(
       let result
       if (planningModel) {
         if ('chat' in planningModel) {
-          // It's OpenRouter
-          result = await planningModel.chat.completions.create({
-            model: 'google/gemini-2.5-pro-exp-03-25:free',
-            messages: [{ role: 'user', content: prompt }],
-            temperature: 0.7,
-          })
-        } else {
-          // It's Gemini
-          result = await planningModel.generateContent({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            generationConfig: {
+          // It's OpenRouter - Use structured output
+          const structuredPrompt = `${contextPromptPart}Generate a detailed, step-by-step coding implementation plan for the feature: "${feature_description}".
+          
+          The plan should ONLY include actionable tasks a developer needs to perform within the code. Exclude steps related to project management, deployment, manual testing, documentation updates, or obtaining approvals.
+          
+          For each coding task, include an effort rating (low, medium, or high) based on implementation work involved. High effort tasks often require breakdown.
+          
+          Use these effort definitions:
+          - Low: Simple, quick changes in one or few files, minimal logic changes.
+          - Medium: Requires moderate development time, involves changes across several files/components, includes writing new functions/classes.
+          - High: Significant development time, complex architectural changes, intricate algorithms, deep refactoring.
+          
+          Respond with a valid JSON object containing an array of tasks, each with a description and effort level.`
+
+          const structuredResult = await aiService.callOpenRouterWithSchema(
+            OPENROUTER_MODEL,
+            [{ role: 'user', content: structuredPrompt }],
+            PlanFeatureResponseSchema,
+            { temperature: 0.7 }
+          )
+
+          logToFile(
+            `[TaskServer] Structured result: ${JSON.stringify(
+              structuredResult
+            )}`
+          )
+
+          if (structuredResult.success) {
+            // Convert the structured response to the expected format
+            planSteps = structuredResult.data.tasks.map(
+              (task) => `[${task.effort}] ${task.description}`
+            )
+
+            await addHistoryEntry(featureId, 'model', {
+              step: 'structured_planning_response',
+              response: JSON.stringify(structuredResult.data),
+            })
+
+            // Store the raw response for reference
+            result = structuredResult.rawResponse
+          } else {
+            // Fallback to unstructured response if structured fails
+            console.warn(
+              `[TaskServer] Structured planning failed: ${structuredResult.error}. Falling back to unstructured format.`
+            )
+
+            // Use traditional prompt and formatting
+            result = await planningModel.chat.completions.create({
+              model: OPENROUTER_MODEL,
+              messages: [{ role: 'user', content: prompt }],
               temperature: 0.7,
-            },
-          })
+            })
+          }
+        } else {
+          // It's Gemini - Use structured output
+          const structuredPrompt = `${contextPromptPart}Generate a detailed, step-by-step coding implementation plan for the feature: "${feature_description}".
+          
+          The plan should ONLY include actionable tasks a developer needs to perform within the code. Exclude steps related to project management, deployment, manual testing, documentation updates, or obtaining approvals.
+          
+          For each coding task, include an effort rating (low, medium, or high) based on implementation work involved. High effort tasks often require breakdown.
+          
+          Use these effort definitions:
+          - Low: Simple, quick changes in one or few files, minimal logic changes.
+          - Medium: Requires moderate development time, involves changes across several files/components, includes writing new functions/classes.
+          - High: Significant development time, complex architectural changes, intricate algorithms, deep refactoring.
+          
+          Respond with a valid JSON object containing an array of tasks, each with a description and effort level.`
+
+          const structuredResult = await aiService.callGeminiWithSchema(
+            GEMINI_MODEL,
+            structuredPrompt,
+            PlanFeatureResponseSchema,
+            { temperature: 0.7 }
+          )
+
+          if (structuredResult.success) {
+            // Convert the structured response to the expected format
+            planSteps = structuredResult.data.tasks.map(
+              (task) => `[${task.effort}] ${task.description}`
+            )
+
+            await addHistoryEntry(featureId, 'model', {
+              step: 'structured_planning_response',
+              response: JSON.stringify(structuredResult.data),
+            })
+
+            // Store the raw response for reference
+            result = structuredResult.rawResponse
+          } else {
+            // Fallback to unstructured response if structured fails
+            console.warn(
+              `[TaskServer] Structured planning failed: ${structuredResult.error}. Falling back to unstructured format.`
+            )
+
+            // Use traditional Gemini call
+            result = await planningModel.generateContent({
+              contents: [{ role: 'user', parts: [{ text: prompt }] }],
+              generationConfig: {
+                temperature: 0.7,
+              },
+            })
+          }
         }
       }
 
@@ -317,7 +412,7 @@ export async function handlePlanFeature(
 
       if (responseText === null) {
         message =
-          'Error: Failed to get planning response from LLM or response was blocked.'
+          'Error: Failed to get planning response from LLM or response was blocked. AI Agent: Do not try to call again. Simply alert the user.'
         isError = true
         await addHistoryEntry(featureId, 'tool_response', {
           tool: 'plan_feature',
@@ -328,14 +423,33 @@ export async function handlePlanFeature(
         return { content: [{ type: 'text', text: message }], isError }
       }
 
-      await addHistoryEntry(featureId, 'model', {
-        step: 'planning_response',
-        response: responseText,
-      })
-      planSteps = parseGeminiPlanResponse(responseText)
-      await logToFile(
-        `[TaskServer] Received plan with ${planSteps.length} raw steps from LLM.`
-      )
+      // Only add entry if we haven't already done so in the fallback path
+      if (!planSteps.length) {
+        await addHistoryEntry(featureId, 'model', {
+          step: 'planning_response',
+          response: responseText,
+        })
+
+        // Only parse if planSteps is empty (meaning we didn't get structured results or fallback parsing)
+        planSteps = parseGeminiPlanResponse(responseText)
+        await logToFile(
+          `[TaskServer] Received plan with ${planSteps.length} raw steps from LLM.`
+        )
+      }
+
+      // Ensure we have at least some plan steps to proceed
+      if (planSteps.length === 0) {
+        message =
+          'Error: Failed to parse any valid tasks from the LLM response.'
+        isError = true
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'plan_feature',
+          isError: true,
+          message,
+          step: 'task_parsing',
+        })
+        return { content: [{ type: 'text', text: message }], isError }
+      }
 
       // --- Process LLM Response (Effort, Breakdown, Sequencing) ---
 
