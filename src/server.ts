@@ -7,6 +7,7 @@ import { handleGetNextTask } from './tools/getNextTask'
 import { handleMarkTaskComplete } from './tools/markTaskComplete'
 import { handlePlanFeature } from './tools/planFeature'
 import { handleReviewChanges } from './tools/reviewChanges'
+import webSocketService from './services/webSocketService'
 
 // Immediately log that we're starting up
 console.error('[TaskServer] LOG: Starting task manager server...')
@@ -168,6 +169,66 @@ async function main() {
     await logToFile(
       '[TaskServer] LOG: MCP Task Manager Server connected and running on stdio...'
     )
+
+    // Initialize WebSocket service
+    try {
+      await logToFile('[TaskServer] LOG: Initializing WebSocket server...')
+      await webSocketService.initialize()
+      await logToFile(
+        '[TaskServer] LOG: WebSocket server initialized successfully.'
+      )
+    } catch (wsError) {
+      await logToFile(
+        `[TaskServer] WARN: Failed to initialize WebSocket server: ${wsError}`
+      )
+      console.error(
+        '[TaskServer] WARN: WebSocket server initialization failed:',
+        wsError
+      )
+      // Continue execution even if WebSocket server fails
+      // This ensures MCP functionality works even without real-time UI updates
+    }
+
+    // Handle process termination gracefully
+    process.on('SIGINT', async () => {
+      await logToFile(
+        '[TaskServer] LOG: Received SIGINT. Shutting down gracefully...'
+      )
+
+      // Shutdown WebSocket server
+      try {
+        await webSocketService.shutdown()
+        await logToFile(
+          '[TaskServer] LOG: WebSocket server shut down successfully.'
+        )
+      } catch (error) {
+        await logToFile(
+          `[TaskServer] ERROR: Error shutting down WebSocket server: ${error}`
+        )
+      }
+
+      process.exit(0)
+    })
+
+    process.on('SIGTERM', async () => {
+      await logToFile(
+        '[TaskServer] LOG: Received SIGTERM. Shutting down gracefully...'
+      )
+
+      // Shutdown WebSocket server
+      try {
+        await webSocketService.shutdown()
+        await logToFile(
+          '[TaskServer] LOG: WebSocket server shut down successfully.'
+        )
+      } catch (error) {
+        await logToFile(
+          `[TaskServer] ERROR: Error shutting down WebSocket server: ${error}`
+        )
+      }
+
+      process.exit(0)
+    })
   } catch (connectError) {
     console.error(
       '[TaskServer] CRITICAL ERROR during server.connect():',

@@ -40,3 +40,66 @@ export interface BreakdownOptions {
   maxSubtasks?: number
   preferredEffort?: 'low' | 'medium'
 }
+
+// --- WebSocket Message Types ---
+
+export type WebSocketMessageType =
+  | 'tasks_updated'
+  | 'status_changed'
+  | 'show_question'
+  | 'question_response'
+  | 'request_screenshot'
+  | 'request_screenshot_ack'
+  | 'error'
+  | 'connection_established'
+  | 'client_registration'
+
+export interface WebSocketMessage {
+  type: WebSocketMessageType
+  featureId?: string
+  payload?: any
+}
+
+export interface TasksUpdatedPayload {
+  tasks: Task[]
+  updatedAt: string
+}
+
+export interface StatusChangedPayload {
+  taskId: string
+  status: 'pending' | 'completed'
+  updatedAt: string
+}
+
+export interface ShowQuestionPayload {
+  questionId: string
+  question: string
+  options?: string[]
+}
+
+export interface QuestionResponsePayload {
+  questionId: string
+  response: string
+}
+
+export interface RequestScreenshotPayload {
+  requestId: string
+  target?: string
+}
+
+export interface RequestScreenshotAckPayload {
+  requestId: string
+  status: 'success' | 'error'
+  imagePath?: string
+  error?: string
+}
+
+export interface ClientRegistrationPayload {
+  featureId: string
+  clientId?: string
+}
+
+export interface ErrorPayload {
+  code: string
+  message: string
+}

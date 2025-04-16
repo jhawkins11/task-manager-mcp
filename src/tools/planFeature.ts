@@ -2,6 +2,7 @@ import { Task } from '../models/types'
 import { writeTasks, addHistoryEntry } from '../lib/fsUtils'
 import { logToFile } from '../lib/logger'
 import { aiService } from '../services/aiService'
+import webSocketService from '../services/webSocketService'
 import {
   parseGeminiPlanResponse,
   determineTaskEffort,
@@ -492,6 +493,19 @@ export async function handlePlanFeature(
       await logToFile(
         `[TaskServer] New plan saved for feature ${featureId} with ${newTasks.length} total items (${task_count} pending tasks).`
       )
+
+      // Broadcast the tasks update via WebSocket
+      try {
+        webSocketService.notifyTasksUpdated(featureId, newTasks)
+        await logToFile(
+          `[TaskServer] Broadcast tasks_updated event for feature ${featureId}`
+        )
+      } catch (wsError) {
+        await logToFile(
+          `[TaskServer] Warning: Failed to broadcast task update: ${wsError}`
+        )
+        // Don't fail the operation if WebSocket broadcast fails
+      }
 
       // Success message includes the feature ID
       message = `Successfully generated plan for feature ID ${featureId} with ${task_count} pending tasks: "${feature_description}"`

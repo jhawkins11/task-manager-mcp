@@ -14,6 +14,10 @@ const OPENROUTER_MODEL =
   process.env.OPENROUTER_MODEL || 'google/gemini-2.5-pro-exp-03-25:free'
 const REVIEW_LLM_API_KEY = process.env.REVIEW_LLM_API_KEY || GEMINI_API_KEY
 
+// WebSocket server configuration
+const WS_PORT = parseInt(process.env.WS_PORT || '3000', 10)
+const WS_HOST = process.env.WS_HOST || 'localhost'
+
 // Define safety settings for content generation
 import { HarmCategory, HarmBlockThreshold } from '@google/generative-ai'
 const safetySettings = [
@@ -43,4 +47,6 @@ export {
   OPENROUTER_MODEL,
   REVIEW_LLM_API_KEY,
   safetySettings,
+  WS_PORT,
+  WS_HOST,
 }

@@ -18,10 +18,12 @@
     "dotenv": "^16.5.0",
     "openai": "^4.94.0",
     "tiktoken": "^1.0.20",
+    "ws": "^8.16.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/node": "^22.14.1",
+    "@types/ws": "^8.5.10",
     "nodemon": "^3.1.9",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"

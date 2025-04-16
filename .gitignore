@@ -2,3 +2,5 @@ node_modules
 dist
 .env
 repomix-output.txt
+.mcp
+logs

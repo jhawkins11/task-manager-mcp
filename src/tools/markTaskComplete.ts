@@ -1,6 +1,7 @@
 import { Task } from '../models/types'
 import { readTasks, writeTasks, addHistoryEntry } from '../lib/fsUtils'
 import { logToFile } from '../lib/logger'
+import webSocketService from '../services/webSocketService'
 
 interface MarkTaskCompleteParams {
   task_id: string
@@ -123,6 +124,30 @@ export async function handleMarkTaskComplete(
           })
 
           await writeTasks(feature_id, finalTasks)
+
+          // Broadcast task updates via WebSocket
+          try {
+            webSocketService.notifyTasksUpdated(feature_id, finalTasks)
+            webSocketService.notifyTaskStatusChanged(
+              feature_id,
+              task_id,
+              'completed'
+            )
+            webSocketService.notifyTaskStatusChanged(
+              feature_id,
+              parentTaskId!,
+              'completed'
+            )
+            await logToFile(
+              `[TaskServer] Broadcast tasks_updated and status_changed events for feature ${feature_id}`
+            )
+          } catch (wsError) {
+            await logToFile(
+              `[TaskServer] Warning: Failed to broadcast task update: ${wsError}`
+            )
+            // Don't fail the operation if WebSocket broadcast fails
+          }
+
           await logToFile(
             `[TaskServer] Task ${task_id} and parent task marked as complete.`
           )
@@ -144,6 +169,25 @@ export async function handleMarkTaskComplete(
 
       // Pass the correctly mapped array directly
       await writeTasks(feature_id, updatedTasks)
+
+      // Broadcast task updates via WebSocket
+      try {
+        webSocketService.notifyTasksUpdated(feature_id, updatedTasks)
+        webSocketService.notifyTaskStatusChanged(
+          feature_id,
+          task_id,
+          'completed'
+        )
+        await logToFile(
+          `[TaskServer] Broadcast tasks_updated and status_changed events for feature ${feature_id}`
+        )
+      } catch (wsError) {
+        await logToFile(
+          `[TaskServer] Warning: Failed to broadcast task update: ${wsError}`
+        )
+        // Don't fail the operation if WebSocket broadcast fails
+      }
+
       await logToFile(`[TaskServer] Task ${task_id} marked as complete.`)
       message = `Task ${task_id} marked as complete.`
 
