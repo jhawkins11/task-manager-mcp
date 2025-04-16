@@ -24,6 +24,7 @@ import {
 
 // Import OpenAI SDK for OpenRouter
 import OpenAI from 'openai'
+import { encoding_for_model } from 'tiktoken'
 
 console.error('[TaskServer] LOG: Imports completed.') // Log after imports
 
@@ -756,13 +757,14 @@ server.tool(
     let codebaseContext = ''
     try {
       const targetDir = project_path || '.'
-      const command = `npx repomix ${targetDir} --style plain` // Add target directory to command
+      const repomixOutputPath = path.join(targetDir, 'repomix-output.txt')
+      let command = `npx repomix ${targetDir} --style plain --output ${repomixOutputPath}` // Add output path
 
       // Use console.error for synchronous-like logging before async operation
       console.error(`[TaskServer] Running repomix command: ${command}`)
       await logToFile(`[TaskServer] Running repomix command: ${command}`)
 
-      const { stdout, stderr } = await execPromise(command, {
+      let { stdout, stderr } = await execPromise(command, {
         maxBuffer: 10 * 1024 * 1024, // Increased buffer size
       })
 
@@ -777,18 +779,91 @@ server.tool(
       if (!stdout) {
         await logToFile('[TaskServer] repomix stdout was empty.')
       }
+
       // read repomix-output.txt
-      const repomixOutput = await fs.readFile(
-        path.join(targetDir, 'repomix-output.txt'),
-        'utf-8'
-      )
+      const repomixOutput = await fs.readFile(repomixOutputPath, 'utf-8')
       if (!repomixOutput) {
         await logToFile('[TaskServer] repomix-output.txt was empty.')
       }
-      codebaseContext = repomixOutput
-      await logToFile(
-        `[TaskServer] repomix context gathered (${codebaseContext.length} chars) for path: ${targetDir}.`
-      )
+
+      // Check if the output is too large (exceeding token limit)
+      // Use tiktoken for accurate token counting
+      let tokenCount = 0
+      try {
+        const enc = encoding_for_model('gpt-4')
+        tokenCount = enc.encode(repomixOutput).length
+        enc.free() // Free the resources when done
+      } catch (tokenError) {
+        // Fallback to approximation if tiktoken fails
+        await logToFile(
+          `[TaskServer] Token counting failed, using approximation: ${tokenError}`
+        )
+        tokenCount = Math.ceil(repomixOutput.length / 4)
+      }
+
+      const TOKEN_LIMIT = 1000000
+
+      if (tokenCount > TOKEN_LIMIT) {
+        await logToFile(
+          `[TaskServer] Repomix output is too large (${tokenCount.toLocaleString()} tokens). Re-running with --compress flag.`
+        )
+
+        // Re-run with compress flag
+        command = `npx repomix ${targetDir} --style plain --compress --output ${repomixOutputPath}`
+        console.error(
+          `[TaskServer] Re-running repomix with compression: ${command}`
+        )
+        await logToFile(
+          `[TaskServer] Re-running repomix command with compression: ${command}`
+        )
+
+        const compressResult = await execPromise(command, {
+          maxBuffer: 10 * 1024 * 1024,
+        })
+
+        if (compressResult.stderr) {
+          await logToFile(
+            `[TaskServer] repomix (compressed) stderr: ${compressResult.stderr}`
+          )
+        }
+
+        // Read the new compressed output
+        const compressedOutput = await fs.readFile(repomixOutputPath, 'utf-8')
+        if (!compressedOutput) {
+          await logToFile(
+            '[TaskServer] Compressed repomix-output.txt was empty.'
+          )
+        }
+
+        // Count tokens in compressed output
+        let compressedTokenCount = 0
+        try {
+          const enc = encoding_for_model('gpt-4')
+          compressedTokenCount = enc.encode(compressedOutput).length
+          enc.free()
+          await logToFile(
+            `[TaskServer] Compressed output token count: ${compressedTokenCount.toLocaleString()}`
+          )
+        } catch (tokenError) {
+          await logToFile(
+            `[TaskServer] Compressed token counting failed: ${tokenError}`
+          )
+        }
+
+        codebaseContext = compressedOutput
+        await logToFile(
+          `[TaskServer] Compressed repomix context gathered (${
+            codebaseContext.length
+          } chars, ~${compressedTokenCount.toLocaleString()} tokens) for path: ${targetDir}.`
+        )
+      } else {
+        codebaseContext = repomixOutput
+        await logToFile(
+          `[TaskServer] repomix context gathered (${
+            codebaseContext.length
+          } chars, ${tokenCount.toLocaleString()} tokens) for path: ${targetDir}.`
+        )
+      }
     } catch (error: any) {
       await logToFile(`[TaskServer] Error running repomix: ${error}`)
       let errorMessage = 'Error running repomix to gather codebase context.'
