@@ -23,7 +23,8 @@ import * as fsSync from 'fs'
 import { encoding_for_model } from 'tiktoken'
 import webSocketService from '../services/webSocketService'
 import { z } from 'zod'
-import { GEMINI_MODEL, OPENROUTER_MODEL } from '../config'
+import { GEMINI_MODEL, OPENROUTER_MODEL, WS_PORT, UI_PORT } from '../config'
+import { dynamicImportDefault } from '../lib/utils'
 
 // Promisify child_process.exec for easier async/await usage
 const execPromise = promisify(exec)
@@ -619,6 +620,28 @@ export async function handlePlanFeature(
           `[TaskServer] Warning: Failed to broadcast task update: ${wsError}`
         )
         // Don't fail the operation if WebSocket broadcast fails
+      }
+
+      // Launch the UI in the user's browser with the feature ID
+      try {
+        const uiUrl = `http://localhost:${UI_PORT}?featureId=${featureId}` // Construct URL with featureId
+
+        await logToFile(`[TaskServer] Launching UI in browser: ${uiUrl}`)
+
+        // Use the dynamic import helper function to get the 'open' function
+        const open = await dynamicImportDefault<typeof import('open')>('open')
+        await open(uiUrl) // Call the dynamically imported function
+
+        await logToFile('[TaskServer] Browser launch initiated successfully')
+      } catch (launchError) {
+        // Log the error but don't fail the operation
+        await logToFile(
+          `[TaskServer] Warning: Failed to launch browser UI: ${launchError}`
+        )
+        console.error(
+          '[TaskServer] Warning: Failed to launch browser UI:',
+          launchError
+        )
       }
 
       // Success message includes the feature ID and task count

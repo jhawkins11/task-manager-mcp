@@ -22,6 +22,8 @@ const REVIEW_LLM_API_KEY = process.env.REVIEW_LLM_API_KEY || GEMINI_API_KEY
 // WebSocket server configuration
 const WS_PORT = parseInt(process.env.WS_PORT || '3000', 10)
 const WS_HOST = process.env.WS_HOST || 'localhost'
+// UI server uses the same port as WebSocket
+const UI_PORT = WS_PORT
 
 // Define safety settings for content generation
 import { HarmCategory, HarmBlockThreshold } from '@google/generative-ai'
@@ -56,4 +58,5 @@ export {
   safetySettings,
   WS_PORT,
   WS_HOST,
+  UI_PORT,
 }
