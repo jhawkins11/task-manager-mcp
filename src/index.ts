@@ -50,7 +50,7 @@ const execPromise = util.promisify(exec)
 
 // --- Configuration ---
 console.error('[TaskServer] LOG: Reading configuration...')
-const TASK_FILE_PATH = path.resolve(__dirname, '.mcp_tasks.json')
+const FEATURE_TASKS_DIR = path.resolve(__dirname, '.mcp', 'features') // Directory for feature-specific task files
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash' // Updated default model
@@ -138,14 +138,28 @@ type Task = z.infer<typeof TaskSchema>
 
 // --- Helper Functions ---
 
-async function readTasks(): Promise<Task[]> {
-  // (User's implementation preserved)
+/**
+ * Gets the absolute path to a feature-specific task file
+ * @param featureId The unique ID of the feature
+ * @returns The absolute path to the feature's task file
+ */
+function getFeatureTaskFilePath(featureId: string): string {
+  return path.join(FEATURE_TASKS_DIR, `${featureId}_mcp_tasks.json`)
+}
+
+/**
+ * Reads tasks for a specific feature from its task file
+ * @param featureId The unique ID of the feature
+ * @returns Array of tasks for the feature
+ */
+async function readTasks(featureId: string): Promise<Task[]> {
+  const taskFilePath = getFeatureTaskFilePath(featureId)
   try {
-    await fs.access(TASK_FILE_PATH)
-    const data = await fs.readFile(TASK_FILE_PATH, 'utf-8')
+    await fs.access(taskFilePath)
+    const data = await fs.readFile(taskFilePath, 'utf-8')
     if (!data.trim()) {
       await logToFile(
-        `[TaskServer] Info: Task file at ${TASK_FILE_PATH} is empty. Starting fresh.`
+        `[TaskServer] Info: Task file at ${taskFilePath} is empty. Starting fresh.`
       )
       return []
     }
@@ -155,12 +169,12 @@ async function readTasks(): Promise<Task[]> {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
       // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
       console.error(
-        `[TaskServer] Info: No task file found at ${TASK_FILE_PATH}. Starting fresh.`
+        `[TaskServer] Info: No task file found at ${taskFilePath}. Starting fresh.`
       )
     } else {
       // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
       console.error(
-        `[TaskServer] Error reading tasks file at ${TASK_FILE_PATH}:`,
+        `[TaskServer] Error reading tasks file at ${taskFilePath}:`,
         error
       )
     }
@@ -168,13 +182,18 @@ async function readTasks(): Promise<Task[]> {
   }
 }
 
-async function writeTasks(tasks: Task[]): Promise<void> {
-  // (User's implementation preserved)
+/**
+ * Writes tasks for a specific feature to its task file
+ * @param featureId The unique ID of the feature
+ * @param tasks Array of tasks to write
+ */
+async function writeTasks(featureId: string, tasks: Task[]): Promise<void> {
+  const taskFilePath = getFeatureTaskFilePath(featureId)
   try {
-    await fs.mkdir(path.dirname(TASK_FILE_PATH), { recursive: true })
+    await fs.mkdir(path.dirname(taskFilePath), { recursive: true })
     const validatedTasks = TaskListSchema.parse(tasks)
-    await fs.writeFile(TASK_FILE_PATH, JSON.stringify(validatedTasks, null, 2))
-    await logToFile(`[TaskServer] Info: Tasks saved to ${TASK_FILE_PATH}`)
+    await fs.writeFile(taskFilePath, JSON.stringify(validatedTasks, null, 2))
+    await logToFile(`[TaskServer] Info: Tasks saved to ${taskFilePath}`)
   } catch (error) {
     // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
     console.error('[TaskServer] Error writing tasks:', error)
@@ -527,17 +546,47 @@ console.error('[TaskServer] LOG: Defining tools...')
 // 1. Tool: get_next_task
 server.tool(
   'get_next_task', // name
-  {}, // inputSchema shape (empty object for no input)
+  {
+    // inputSchema shape
+    feature_id: z
+      .string()
+      .uuid({ message: 'Valid feature ID (UUID) is required.' }),
+  },
   // handler - input type inferred, return type defines output structure
-  async ({}) => {
-    await logToFile('[TaskServer] Handling get_next_task request...')
-    const tasks = await readTasks()
+  async ({ feature_id }) => {
+    await logToFile(
+      `[TaskServer] Handling get_next_task request for feature: ${feature_id}`
+    )
+    const tasks = await readTasks(feature_id)
+
+    if (tasks.length === 0) {
+      await logToFile(
+        `[TaskServer] No tasks found for feature ID: ${feature_id}`
+      )
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No tasks found for feature ID: ${feature_id}. The feature may not exist or has not been planned yet.`,
+          },
+        ],
+        isError: true,
+      }
+    }
+
     const pendingTasks = tasks.filter((task) => task.status === 'pending')
 
     if (pendingTasks.length === 0) {
-      await logToFile('[TaskServer] No pending tasks found.')
+      await logToFile(
+        `[TaskServer] No pending tasks found for feature ID: ${feature_id}`
+      )
       return {
-        content: [{ type: 'text', text: 'No pending tasks found.' }],
+        content: [
+          {
+            type: 'text',
+            text: `No pending tasks found for feature ID: ${feature_id}. All tasks have been completed.`,
+          },
+        ],
       }
     }
 
@@ -634,13 +683,16 @@ server.tool(
   {
     // inputSchema shape
     task_id: z.string().uuid({ message: 'Valid task ID (UUID) is required.' }),
+    feature_id: z
+      .string()
+      .uuid({ message: 'Valid feature ID (UUID) is required.' }),
   },
   // handler - input type inferred ({task_id}), return type defines output structure
-  async ({ task_id }) => {
+  async ({ task_id, feature_id }) => {
     await logToFile(
-      `[TaskServer] Handling mark_task_complete request for ID: ${task_id}`
+      `[TaskServer] Handling mark_task_complete request for ID: ${task_id} in feature: ${feature_id}`
     )
-    const tasks = await readTasks()
+    const tasks = await readTasks(feature_id)
     let taskFound = false
     let alreadyCompleted = false
     let isSubtask = false
@@ -667,9 +719,20 @@ server.tool(
     let message: string
     let isError = false
 
+    if (tasks.length === 0) {
+      await logToFile(
+        `[TaskServer] No tasks found for feature ID: ${feature_id}`
+      )
+      message = `Error: No tasks found for feature ID ${feature_id}. The feature may not exist or has not been planned yet.`
+      isError = true
+      return { content: [{ type: 'text', text: message }], isError }
+    }
+
     if (!taskFound) {
-      await logToFile(`[TaskServer] Task ${task_id} not found.`)
-      message = `Error: Task with ID ${task_id} not found.`
+      await logToFile(
+        `[TaskServer] Task ${task_id} not found in feature: ${feature_id}`
+      )
+      message = `Error: Task with ID ${task_id} not found in feature ${feature_id}.`
       isError = true
       return { content: [{ type: 'text', text: message }], isError }
     } else if (alreadyCompleted) {
@@ -697,7 +760,7 @@ server.tool(
             return task
           })
 
-          await writeTasks(finalTasks)
+          await writeTasks(feature_id, finalTasks)
           await logToFile(
             `[TaskServer] Task ${task_id} and parent task marked as complete.`
           )
@@ -707,7 +770,7 @@ server.tool(
       }
 
       // Pass the correctly mapped array directly
-      await writeTasks(updatedTasks)
+      await writeTasks(feature_id, updatedTasks)
       await logToFile(`[TaskServer] Task ${task_id} marked as complete.`)
       message = `Task ${task_id} marked as complete.`
     }
@@ -735,10 +798,13 @@ server.tool(
   },
   // handler - input type inferred ({feature_description, project_path}), return type defines output structure
   async ({ feature_description, project_path }) => {
+    // Generate a unique feature ID
+    const featureId = crypto.randomUUID()
+
     await logToFile(
       `[TaskServer] Handling plan_feature request: "${feature_description}" (Path: ${
         project_path || 'CWD'
-      })`
+      }), Feature ID: ${featureId}`
     )
 
     let message: string
@@ -1080,26 +1146,15 @@ server.tool(
     })
     try {
       await logToFile('[TaskServer] Saving new task plan...')
-      let existingTasks: Task[] = []
 
-      try {
-        existingTasks = await readTasks()
-      } catch (readError) {
-        await logToFile(
-          `[TaskServer] Error reading existing tasks: ${readError}. Starting with empty task list.`
-        )
-        existingTasks = []
-      }
+      // Each feature should have its own set of tasks
+      // Do not read existing tasks from other features
 
-      const completedTasks = existingTasks.filter(
-        (task) => task.status === 'completed'
-      )
-
-      // Ensure no ID collisions between new tasks and existing completed tasks
-      const existingIds = new Set(completedTasks.map((task) => task.id))
+      // Ensure no ID collisions between tasks (parent/child relationships)
+      const existingIds = new Set<string>()
       let idCollisions = 0
 
-      // Regenerate any IDs that collide with existing tasks
+      // Regenerate any IDs that collide within the new task set
       newTasks.forEach((task) => {
         let collisionCount = 0
         // Ensure the parent container tasks get their specific ID if it exists in the map
@@ -1111,9 +1166,9 @@ server.tool(
           task.id = mappedParentId
         } else if (task.parentTaskId && !existingIds.has(task.parentTaskId)) {
           // Check if parent ID exists before assigning it
-          const parentTaskExists =
-            newTasks.some((t) => t.id === task.parentTaskId) ||
-            completedTasks.some((t) => t.id === task.parentTaskId)
+          const parentTaskExists = newTasks.some(
+            (t: Task) => t.id === task.parentTaskId
+          )
           if (!parentTaskExists) {
             console.warn(
               `[TaskServer] Subtask '${task.description.substring(
@@ -1128,10 +1183,10 @@ server.tool(
         }
 
         // Handle potential collisions for newly generated IDs
-        while (task.status === 'pending' && existingIds.has(task.id)) {
-          // Only check pending tasks for collisions
+        while (existingIds.has(task.id)) {
+          // Check for collisions within the new tasks set
           console.error(
-            `[TaskServer] Task ID collision detected for pending task, regenerating ID...`
+            `[TaskServer] Task ID collision detected for task, regenerating ID...`
           )
           collisionCount++
           task.id = crypto.randomUUID()
@@ -1149,7 +1204,7 @@ server.tool(
           idCollisions += collisionCount
         }
 
-        // Add this ID to our set to avoid collisions between new tasks too
+        // Add this ID to our set to avoid collisions between new tasks
         existingIds.add(task.id)
       })
 
@@ -1163,9 +1218,9 @@ server.tool(
       newTasks.forEach((task) => {
         // Double check parent references after potential ID regeneration
         if (task.parentTaskId && !existingIds.has(task.parentTaskId)) {
-          const parentTaskExists =
-            newTasks.some((t) => t.id === task.parentTaskId) ||
-            completedTasks.some((t) => t.id === task.parentTaskId)
+          const parentTaskExists = newTasks.some(
+            (t: Task) => t.id === task.parentTaskId
+          )
           if (!parentTaskExists) {
             console.warn(
               `[TaskServer] Task '${task.description.substring(
@@ -1180,13 +1235,20 @@ server.tool(
         }
       })
 
-      const finalTaskList = [...completedTasks, ...newTasks]
+      // Use only the new tasks for this feature
+      const finalTaskList = [...newTasks]
 
       try {
-        await writeTasks(finalTaskList)
+        // Create the feature tasks directory if it doesn't exist
+        await fs.mkdir(FEATURE_TASKS_DIR, { recursive: true })
+
+        // Write tasks to the feature-specific file
+        await writeTasks(featureId, finalTaskList)
         task_count = newTasks.length
-        await logToFile(`[TaskServer] New plan saved with ${task_count} tasks.`)
-        message = `Successfully generated plan with ${task_count} tasks for feature: "${feature_description}"`
+        await logToFile(
+          `[TaskServer] New plan saved with ${task_count} tasks for feature: ${featureId}`
+        )
+        message = `Successfully generated plan with ${task_count} tasks for feature: "${feature_description}" (Feature ID: ${featureId})`
       } catch (writeError) {
         await logToFile(
           `[TaskServer] Error writing tasks to file: ${writeError}`
@@ -1196,15 +1258,23 @@ server.tool(
         isError = true
       }
 
-      // FIXED: Return structure
-      return { content: [{ type: 'text', text: message }], isError }
+      // Return with feature ID included
+      return {
+        content: [{ type: 'text', text: message }],
+        isError,
+        featureId,
+      }
     } catch (error) {
       // Reverted from await logToFile due to potential top-level await issues/reliability in error handlers
       console.error('[TaskServer] Error saving the new task plan:', error)
       message = 'Error saving the generated task plan.'
       isError = true
-      // FIXED: Return structure
-      return { content: [{ type: 'text', text: message }], isError }
+      // Return with feature ID included if available
+      return {
+        content: [{ type: 'text', text: message }],
+        isError,
+        featureId,
+      }
     }
   }
 )
