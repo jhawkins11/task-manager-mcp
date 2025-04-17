@@ -11,13 +11,15 @@ import {
   HistoryEntry,
   FeatureHistorySchema,
   TaskSchema,
+  LLMClarificationRequestSchema,
 } from '../models/types'
 import { aiService } from '../services/aiService'
 import { logToFile } from './logger'
 import { safetySettings, OPENROUTER_MODEL, GEMINI_MODEL } from '../config'
 import { z } from 'zod'
 import { encoding_for_model } from 'tiktoken'
-import { addHistoryEntry } from './fsUtils'
+import { addHistoryEntry, writeTasks } from './fsUtils'
+import webSocketService from '../services/webSocketService'
 
 /**
  * Parses the text response from Gemini into a list of tasks.
@@ -179,7 +181,19 @@ Guidelines:
 4. The subtasks should represent a logical sequence for implementation.
 5. Only include coding tasks, not testing, documentation, or deployment steps.
 
-Respond with a JSON object containing an array of subtasks, each with a description and effort level.
+**IMPORTANT: Respond ONLY with a valid JSON object.** The object MUST have a single key named "subtasks". The value of "subtasks" MUST be an array of JSON objects, where each object represents a subtask and has the following keys:
+  - "description": (string) The description of the subtask.
+  - "effort": (string) The estimated effort level, MUST be either "low" or "medium".
+
+**Example of the exact required output format:**
+{
+  "subtasks": [
+    { "description": "Subtask 1 description", "effort": "medium" },
+    { "description": "Subtask 2 description", "effort": "low" }
+  ]
+}
+
+Do NOT include any other text, markdown formatting, or explanations outside of this JSON object.
 `
 
   try {
@@ -499,10 +513,7 @@ export async function processAndBreakdownTasks(
         : 'medium'
 
       // Get the predetermined ID for parent containers, otherwise generate new
-      // Note: The complexTaskMap uses the *original* high-effort description before breakdown
-      const originalHighEffortDesc = isParentContainer
-        ? cleanDescription // The cleanDescription of a parent container *is* the original high-effort desc
-        : null
+      const originalHighEffortDesc = isParentContainer ? cleanDescription : null
 
       const taskId =
         (originalHighEffortDesc &&
@@ -523,32 +534,62 @@ export async function processAndBreakdownTasks(
         updatedAt: new Date().toISOString(),
       }
 
+      // --- Enhanced Logging ---
+      logToFile(
+        `[processAndBreakdownTasks] Preparing ${
+          isParentContainer ? 'Parent' : parentTaskId ? 'Subtask' : 'Task'
+        } for validation: ID=${taskId}, Status=${status}, Parent=${
+          parentTaskId || 'N/A'
+        }, Desc="${cleanDescription.substring(0, 50)}..."`
+      )
+      logToFile(
+        `[processAndBreakdownTasks] Task data before validation: ${JSON.stringify(
+          taskData
+        )}`
+      )
+      // --- End Enhanced Logging ---
+
       // Validate against the Task schema before pushing
       const validationResult = TaskSchema.safeParse(taskData)
       if (validationResult.success) {
+        // --- Enhanced Logging ---
+        logToFile(
+          `[processAndBreakdownTasks] Validation successful for Task ID: ${taskId}`
+        )
+        // --- End Enhanced Logging ---
         finalTasks.push(validationResult.data)
       } else {
-        taskCreationErrors.push(
-          `Task "${cleanDescription.substring(0, 30)}..." failed validation: ${
-            validationResult.error.message
-          }`
-        )
+        // --- Enhanced Logging ---
+        const errorMsg = `Task "${cleanDescription.substring(
+          0,
+          30
+        )}..." (ID: ${taskId}) failed validation: ${
+          validationResult.error.message
+        }`
+        logToFile(`[processAndBreakdownTasks] ${errorMsg}`)
+        // --- End Enhanced Logging ---
+        taskCreationErrors.push(errorMsg)
         console.warn(
           `[TaskServer] Task validation failed for "${cleanDescription.substring(
             0,
             30
-          )}...":`,
+          )}..." (ID: ${taskId}):`,
           validationResult.error.flatten()
         )
       }
     } catch (creationError) {
-      taskCreationErrors.push(
-        `Error creating task object for step "${step.substring(0, 30)}...": ${
-          creationError instanceof Error
-            ? creationError.message
-            : String(creationError)
-        }`
-      )
+      const errorMsg = `Error creating task object for step "${step.substring(
+        0,
+        30
+      )}...": ${
+        creationError instanceof Error
+          ? creationError.message
+          : String(creationError)
+      }`
+      // --- Enhanced Logging ---
+      logToFile(`[processAndBreakdownTasks] ${errorMsg}`)
+      // --- End Enhanced Logging ---
+      taskCreationErrors.push(errorMsg)
       console.error(
         `[TaskServer] Error creating task object for step "${step.substring(
           0,
@@ -571,4 +612,141 @@ export async function processAndBreakdownTasks(
   }
 
   return { finalTasks, complexTaskMap }
+}
+
+/**
+ * Centralized function to process a list of raw task steps, ensure effort,
+ * breakdown complex tasks, save them, and notify the UI.
+ *
+ * @param rawPlanSteps Raw task descriptions, potentially with effort tags.
+ * @param model The LLM instance to use for processing.
+ * @param featureId The ID of the feature being planned.
+ * @returns The final list of processed Task objects.
+ */
+export async function processAndFinalizePlan(
+  rawPlanSteps: string[],
+  model: GenerativeModel | OpenAI | null,
+  featureId: string
+): Promise<Task[]> {
+  try {
+    // 1. Ensure effort ratings
+    const effortRatedSteps = await ensureEffortRatings(rawPlanSteps, model)
+
+    // 2. Process and breakdown tasks
+    const { finalTasks } = await processAndBreakdownTasks(
+      effortRatedSteps,
+      model,
+      featureId
+    )
+
+    // 3. Save the tasks
+    await writeTasks(featureId, finalTasks)
+
+    // 4. Notify clients that tasks have been updated
+    webSocketService.notifyTasksUpdated(featureId, finalTasks)
+
+    logToFile(
+      `[processAndFinalizePlan] Processed ${finalTasks.length} final tasks for feature ${featureId}`
+    )
+
+    return finalTasks
+  } catch (error: any) {
+    logToFile(
+      `[processAndFinalizePlan] Error processing plan for feature ${featureId}: ${error.message}`
+    )
+    // Re-throw the error to be handled by the specific caller context
+    throw error
+  }
+}
+
+/**
+ * Detects if the LLM response contains a clarification request.
+ * This function searches for both JSON-formatted clarification requests and
+ * special prefix format like [CLARIFICATION_NEEDED].
+ *
+ * @param responseText The raw response from the LLM
+ * @returns An object with success flag and either the parsed clarification request or error message
+ */
+export function detectClarificationRequest(
+  responseText: string | null | undefined
+):
+  | {
+      detected: true
+      clarificationRequest: z.infer<typeof LLMClarificationRequestSchema>
+      rawResponse: string
+    }
+  | { detected: false; rawResponse: string | null } {
+  if (!responseText) {
+    return { detected: false, rawResponse: null }
+  }
+
+  // Check for [CLARIFICATION_NEEDED] format
+  const prefixMatch = responseText.match(
+    /\[CLARIFICATION_NEEDED\](.*?)(\[END_CLARIFICATION\]|$)/s
+  )
+  if (prefixMatch) {
+    const questionText = prefixMatch[1].trim()
+
+    // Parse out options if they exist
+    const optionsMatch = questionText.match(/Options:\s*\[(.*?)\]/)
+    const options = optionsMatch
+      ? optionsMatch[1].split(',').map((o) => o.trim())
+      : undefined
+
+    // Check if text input is allowed
+    const allowsText = !questionText.includes('MULTIPLE_CHOICE_ONLY')
+
+    // Create a clarification request object
+    return {
+      detected: true,
+      clarificationRequest: {
+        type: 'clarification_needed',
+        question: questionText
+          .replace(/Options:\s*\[.*?\]/, '')
+          .replace('MULTIPLE_CHOICE_ONLY', '')
+          .trim(),
+        options,
+        allowsText,
+      },
+      rawResponse: responseText,
+    }
+  }
+
+  // Try to parse as JSON
+  try {
+    // Check if we have a JSON object in the response
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/)
+    if (jsonMatch) {
+      const jsonStr = jsonMatch[0]
+      const parsedJson = JSON.parse(jsonStr)
+
+      // Check if it's a clarification request
+      if (
+        parsedJson.type === 'clarification_needed' ||
+        parsedJson.clarification_needed ||
+        parsedJson.needs_clarification
+      ) {
+        // Attempt to validate against our schema
+        const result = LLMClarificationRequestSchema.safeParse({
+          type: 'clarification_needed',
+          question: parsedJson.question || parsedJson.message || '',
+          options: parsedJson.options || undefined,
+          allowsText: parsedJson.allowsText !== false,
+        })
+
+        if (result.success) {
+          return {
+            detected: true,
+            clarificationRequest: result.data,
+            rawResponse: responseText,
+          }
+        }
+      }
+    }
+
+    return { detected: false, rawResponse: responseText }
+  } catch (error) {
+    // If JSON parsing fails, it's not a JSON-formatted clarification request
+    return { detected: false, rawResponse: responseText }
+  }
 }

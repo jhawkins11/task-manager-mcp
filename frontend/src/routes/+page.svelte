@@ -9,21 +9,26 @@
 	import * as Select from '$lib/components/ui/select';
 	import { Progress } from '$lib/components/ui/progress';
 	import { Loader2 } from 'lucide-svelte';
-	import type { Task, WebSocketMessage } from '$lib/types'; // Import WebSocketMessage type
+	import { writable, type Writable } from 'svelte/store';
+	import type { Task, WebSocketMessage, ShowQuestionPayload, QuestionResponsePayload } from '$lib/types';
 	import { TaskStatus, TaskEffort } from '$lib/types';
 	import type { Selected } from 'bits-ui';
+	import QuestionModal from '$lib/components/QuestionModal.svelte';
 
-	let tasks: Task[] = [];
+	// Convert to writable stores for better state management
+	const tasks: Writable<Task[]> = writable([]);
 	let nestedTasks: Task[] = [];
-	let loading = true;
-	let error: string | null = null; 
+	const loading: Writable<boolean> = writable(true);
+	const error: Writable<string | null> = writable(null);
 	let featureId: string | null = null;
 	let features: string[] = [];
 	let loadingFeatures = true;
-	// let loadingRefresh = false; // Can likely remove this
-	// let pollingIntervalId: number | null = null; // Remove polling variable
 	let ws: WebSocket | null = null;
 	let wsStatus: 'connecting' | 'connected' | 'disconnected' = 'disconnected';
+
+	// Question modal state
+	let showQuestionModal = false;
+	let questionData: ShowQuestionPayload | null = null;
 
 	// --- WebSocket Functions ---
 	function connectWebSocket() {
@@ -61,13 +66,42 @@
 
 				switch (message.type) {
 					case 'tasks_updated':
-					case 'status_changed': // Refresh on status change too
-						console.log(`[WS Client] Received ${message.type}, refreshing tasks for feature ${featureId}...`);
-						refreshTasks(); // Re-fetch tasks for the current feature
+						console.log(`[WS Client] Received tasks_updated for feature ${featureId}:`, message.payload.tasks);
+						if (message.payload?.tasks) {
+							// Directly update tasks store instead of triggering a fetch
+							tasks.set(message.payload.tasks as Task[]);
+							// Explicitly set loading to false
+							loading.set(false);
+							error.set(null); // Clear any previous errors
+						}
+						break;
+					case 'status_changed':
+						console.log(`[WS Client] Received status_changed for task ${message.payload?.taskId}`);
+						if (message.payload?.taskId && message.payload?.status) {
+							tasks.update(currentTasks =>
+								currentTasks.map(task =>
+									task.id === message.payload.taskId
+										? { ...task, status: message.payload.status, completed: message.payload.status === 'completed' }
+										: task
+								)
+							);
+							// Status change doesn't imply general loading state change
+						}
+						break;
+					case 'show_question':
+						console.log('[WS Client] Received clarification question:', message.payload);
+						// Store question data and show modal
+						questionData = message.payload as ShowQuestionPayload;
+						showQuestionModal = true;
+						// When question arrives, we should stop loading indicator
+						loading.set(false);
 						break;
 					case 'error':
 						console.error('[WS Client] Received error message:', message.payload);
-						// Optionally display a user-facing error
+						// Display user-facing error
+						error.set(message.payload?.message || 'Received error from server.');
+						// Error likely means loading is done (with an error)
+						loading.set(false);
 						break;
 					case 'connection_established':
 						console.log('[WS Client] Server confirmed connection.');
@@ -79,21 +113,22 @@
 				}
 			} catch (e) {
 				console.error('[WS Client] Error processing message:', e);
+				loading.set(false); // Ensure loading is set to false on error
 			}
 		};
 
 		ws.onerror = (error) => {
 			console.error('[WS Client] WebSocket error:', error);
 			wsStatus = 'disconnected';
-			// Optionally add more robust error handling or reconnection attempts
+			loading.set(false); // Ensure loading is false on WebSocket error
 		};
 
 		ws.onclose = (event) => {
 			console.log(`[WS Client] WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`);
 			wsStatus = 'disconnected';
 			ws = null;
-			// Attempt to reconnect after a delay?
-			// setTimeout(connectWebSocket, 5000); // Example: Try reconnecting after 5 seconds
+			// Ensure loading is false when WebSocket disconnects
+			loading.set(false);
 		};
 	}
 
@@ -113,8 +148,8 @@
 	// --- Component Lifecycle & Data Fetching ---
 
 	async function fetchTasks(selectedFeatureId?: string) {
-		loading = true;
-		error = '';
+		loading.set(true);
+		error.set(null);
 		
 		try {
 			// Construct the API endpoint based on whether we have a featureId
@@ -130,7 +165,7 @@
 			const data = await response.json();
 			
 			// Convert API response to our Task type
-			tasks = data.map((task: any) => {
+			const mappedData = data.map((task: any) => {
 				// Ensure status is one of our enum values
 				let status: TaskStatus;
 				if (task.status === 'completed') {
@@ -170,15 +205,22 @@
 				} as Task;
 			});
 			
-			if (tasks.length === 0) {
-				error = 'No tasks found for this feature.';
+			tasks.set(mappedData);
+			
+			if (mappedData.length === 0) {
+				error.set('No tasks found for this feature.');
 			}
 		} catch (err) {
-			error = err instanceof Error ? err.message : 'An error occurred';
-			console.error('Error fetching tasks:', err);
-			tasks = []; // Clear any previous tasks
+			error.set(err instanceof Error ? err.message : 'An error occurred');
+			// Add more detailed logging
+			console.error('[fetchTasks] Error fetching tasks:', err);
+			if (err instanceof Error && err.cause) {
+				console.error('[fetchTasks] Error Cause:', err.cause);
+			}
+			tasks.set([]); // Clear any previous tasks
 		} finally {
-			loading = false;
+			// Always reset loading state when fetch completes
+			loading.set(false);
 		}
 	}
 
@@ -198,40 +240,84 @@
 		}
 	}
 
+	// New function to fetch pending question
+	async function fetchPendingQuestion(id: string): Promise<ShowQuestionPayload | null> {
+		console.log(`[Pending Question] Checking for feature ${id}...`);
+		try {
+			const response = await fetch(`/api/features/${id}/pending-question`);
+			if (!response.ok) {
+				throw new Error(`HTTP error! status: ${response.status}`);
+			}
+			const data: ShowQuestionPayload | null = await response.json();
+			if (data) {
+				console.log('[Pending Question] Found pending question:', data);
+				return data;
+			} else {
+				console.log('[Pending Question] No pending question found.');
+				return null;
+			}
+		} catch (err) {
+			console.error('[Pending Question] Error fetching pending question:', err);
+			error.set(err instanceof Error ? `Error checking for pending question: ${err.message}` : 'An error occurred while checking for pending questions.');
+			return null;
+		}
+	}
+
 	onMount(async () => {
+		loading.set(true); // Set loading true at the start
+		error.set(null); // Reset error
+
 		// Extract featureId from URL query parameters
 		featureId = $page.url.searchParams.get('featureId');
 		
-		// Fetch features first
+		// Fetch available features first
 		await fetchFeatures();
 		
-		// Initial task fetch logic (remains the same)
+		// Determine the featureId to use (from URL or latest)
 		if (!featureId && features.length > 0) {
+			// Attempt to fetch default tasks to find the latest featureId
 			await fetchTasks(); 
-			if (tasks.length > 0 && tasks[0].feature_id) {
-				featureId = tasks[0].feature_id;
+			if ($tasks.length > 0 && $tasks[0]?.feature_id) {
+				featureId = $tasks[0].feature_id;
+				console.log(`[onMount] Determined latest featureId: ${featureId}`);
+			} else {
+				console.log('[onMount] Could not determine latest featureId from default tasks.');
+				// If no featureId determined, use the first from the list if available
+				if (features.length > 0) {
+					featureId = features[0];
+					console.log(`[onMount] Using first available featureId: ${featureId}`);
+				}
 			}
-		} else if (featureId) {
-			await fetchTasks(featureId);
+		}
+		
+		// Now, if we have a featureId, check for pending questions and fetch tasks
+		if (featureId) {
+			console.log(`[onMount] Operating with featureId: ${featureId}`);
+			// Check for pending question first
+			const pendingQuestion = await fetchPendingQuestion(featureId);
+			if (pendingQuestion) {
+				questionData = pendingQuestion;
+				showQuestionModal = true;
+				// Still fetch tasks even if question is shown, they might exist
+				await fetchTasks(featureId);
+			} else {
+				// No pending question, just fetch tasks
+				await fetchTasks(featureId);
+			}
 		} else {
-			loading = false; 
-			if (!error) { 
-				error = 'No features found. Create a feature first using the task manager CLI.';
+			// No featureId could be determined
+			console.log('[onMount] No featureId available.');
+			if (!$error) { // Only set error if fetchTasks didn't already set one
+				error.set('No features found. Create a feature first using the task manager CLI.');
 			}
+			tasks.set([]); // Ensure tasks are empty
+			nestedTasks = [];
 		}
 
 		// Connect WebSocket AFTER initial data load and featureId determination
-		connectWebSocket();
-
-		// Remove polling logic
-		/*
-		pollingIntervalId = window.setInterval(() => {
-			if (!loading) {
-				console.log('Polling for task updates...');
-				refreshTasks();
-			}
-		}, 10000);
-		*/
+		if (featureId) {
+			connectWebSocket();
+		}
 	});
 
 	onDestroy(() => {
@@ -241,31 +327,23 @@
 			ws.close();
 			ws = null;
 		}
-
-		// Remove polling cleanup
-		/*
-		if (pollingIntervalId) {
-			clearInterval(pollingIntervalId);
-			console.log('Cleared task polling interval.'); 
-		}
-		*/
 	});
 
 	function toggleTaskStatus(taskId: string) {
-		// The UI update happens optimistically as before
-		const taskIndex = tasks.findIndex((t) => t.id === taskId);
+		const tasksList = $tasks;
+		const taskIndex = tasksList.findIndex((t) => t.id === taskId);
 		if (taskIndex !== -1) {
-			const task = tasks[taskIndex];
+			const task = tasksList[taskIndex];
 			const newStatus = task.status === TaskStatus.COMPLETED ? TaskStatus.PENDING : TaskStatus.COMPLETED;
-			tasks[taskIndex].status = newStatus;
-			tasks[taskIndex].completed = newStatus === TaskStatus.COMPLETED;
-			tasks = [...tasks];
+			tasks.update(currentTasks =>
+				currentTasks.map(t =>
+					t.id === taskId
+						? { ...t, status: newStatus, completed: newStatus === TaskStatus.COMPLETED }
+						: t
+				)
+			);
 			processNestedTasks();
 		}
-		// NOTE: We no longer need to manually trigger a backend update here 
-		// if the external 'mark_complete' tool is the source of truth for completion.
-		// If toggling the checkbox *should* also update the backend, 
-		// we'd need a separate fetch call here, and the backend should broadcast.
 	}
 
 	function getEffortBadgeVariant(effort: string) {
@@ -299,7 +377,7 @@
 		type TaskWithChildren = Task & { children: Task[] };
 
 		const taskMap = new Map<string, TaskWithChildren>(
-			tasks.map(task => [task.id, { ...task, children: [] }])
+			$tasks.map(task => [task.id, { ...task, children: [] }])
 		);
 		const rootTasks: Task[] = [];
 
@@ -324,8 +402,8 @@
 	}
 
 	function refreshTasks() {
-		if (loading) return;
-		console.log('[Task List] Refreshing tasks...') 
+		if ($loading) return;
+		console.log('[Task List] Refreshing tasks...');
 		fetchTasks(featureId || undefined);
 	}
 
@@ -354,16 +432,47 @@
 		}
 	}
 
+	// Handle user response to clarification question
+	function handleQuestionResponse(event: CustomEvent) {
+		const response = event.detail;
+		console.log('[WS Client] User responded to question:', response);
+		
+		if (questionData && featureId) {
+			// Send the response back to the server
+			sendWsMessage({
+				type: 'question_response', 
+				featureId,
+				payload: {
+					questionId: questionData.questionId,
+					response: response.response
+				} as QuestionResponsePayload
+			});
+			
+			// Reset modal state
+			showQuestionModal = false;
+			questionData = null;
+		}
+	}
+
+	// Handle user cancellation of question
+	function handleQuestionCancel() {
+		console.log('[WS Client] User cancelled question');
+		showQuestionModal = false;
+		questionData = null;
+	}
+
 	// ... reactive variables ...
-	$: completedCount = tasks.filter(t => t.completed).length;
-	$: totalTasks = tasks.length;
+	$: completedCount = $tasks.filter(t => t.completed).length;
+	$: totalTasks = $tasks.length;
 	$: progress = totalTasks > 0 ? (completedCount / totalTasks) * 100 : 0;
-	$: firstPendingTaskIndex = tasks.findIndex(t => t.status === TaskStatus.PENDING);
+	$: firstPendingTaskIndex = $tasks.findIndex(t => t.status === TaskStatus.PENDING);
 	$: selectedFeatureLabel = features.find(f => f === featureId) || 'Select Feature';
 
 	// Call processNestedTasks whenever the raw tasks array changes
-	$: if (tasks) {
-		processNestedTasks();
+	$: {
+		if ($tasks) {
+			processNestedTasks();
+		}
 	}
 
 </script>
@@ -394,15 +503,15 @@
 		{/if}
 	</div>
 
-	{#if loading}
+	{#if $loading}
 		<div class="flex justify-center items-center h-64">
 			<Loader2 class="h-12 w-12 animate-spin text-primary" />
 		</div>
-	{:else if error}
+	{:else if $error}
 		<Card class="mb-6 border-destructive">
 			<CardHeader>
 				<CardTitle class="text-destructive">Error Loading Tasks</CardTitle>
-				<CardDescription class="text-destructive/90">{error}</CardDescription>
+				<CardDescription class="text-destructive/90">{$error}</CardDescription>
 			</CardHeader>
 		</Card>
 	{:else}
@@ -410,7 +519,7 @@
 			<CardHeader class="border-b border-border px-6 py-4">
 				<CardTitle class="text-xl font-semibold flex justify-between items-center">
 					<span>Tasks</span>
-					<Badge variant="secondary">{tasks.length}</Badge>
+					<Badge variant="secondary">{$tasks.length}</Badge>
 				</CardTitle>
 				<CardDescription class="mt-1">
 					Manage your tasks and track progress for the selected feature.
@@ -425,7 +534,7 @@
 			<CardContent class="p-0">
 				<div class="divide-y divide-border">
 					{#each nestedTasks as task (task.id)}
-						{@const taskIndexInFlatList = tasks.findIndex(t => t.id === task.id)}
+						{@const taskIndexInFlatList = $tasks.findIndex(t => t.id === task.id)}
 						{@const isNextPending = taskIndexInFlatList === firstPendingTaskIndex}
 						{@const isInProgress = task.status === TaskStatus.IN_PROGRESS}
 						<div 
@@ -479,7 +588,7 @@
 						{#if task.children && task.children.length > 0}
 							<div class="ml-8 pl-4 border-l border-border">
 								{#each task.children as childTask (childTask.id)}
-									{@const childTaskIndexInFlatList = tasks.findIndex(t => t.id === childTask.id)}
+									{@const childTaskIndexInFlatList = $tasks.findIndex(t => t.id === childTask.id)}
 									{@const isChildNextPending = childTaskIndexInFlatList === firstPendingTaskIndex}
 									{@const isChildInProgress = childTask.status === TaskStatus.IN_PROGRESS}
 									<div 
@@ -545,8 +654,8 @@
 					<span class="text-sm text-muted-foreground">
 						{completedCount} of {totalTasks} tasks completed
 					</span>
-					<Button variant="outline" size="sm" on:click={refreshTasks} disabled={loading}>
-						{#if loading}
+					<Button variant="outline" size="sm" on:click={refreshTasks} disabled={$loading}>
+						{#if $loading}
 							<Loader2 class="mr-2 h-4 w-4 animate-spin" />
 						{/if}
 						Refresh
@@ -554,6 +663,18 @@
 				</div>
 			</CardFooter>
 		</Card>
+	{/if}
+
+	{#if questionData}
+		<QuestionModal
+			open={showQuestionModal}
+			questionId={questionData.questionId}
+			question={questionData.question}
+			options={questionData.options || []}
+			allowsText={questionData.allowsText !== false}
+			on:response={handleQuestionResponse}
+			on:cancel={handleQuestionCancel}
+		/>
 	{/if}
 </div>
 

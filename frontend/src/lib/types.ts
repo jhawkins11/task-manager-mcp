@@ -64,3 +64,17 @@ export interface WebSocketMessage {
   featureId?: string
   payload?: any // Keep payload generic for now, specific handlers will parse
 }
+
+// Interface for clarification question payload
+export interface ShowQuestionPayload {
+  questionId: string
+  question: string
+  options?: string[]
+  allowsText?: boolean
+}
+
+// Interface for user's response to a clarification question
+export interface QuestionResponsePayload {
+  questionId: string
+  response: string
+}

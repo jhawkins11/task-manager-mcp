@@ -10,6 +10,7 @@ import { handleReviewChanges } from './tools/reviewChanges'
 import { AdjustPlanInputSchema, AdjustPlanInput } from './models/types'
 import { adjustPlanHandler } from './tools/adjustPlan'
 import webSocketService from './services/webSocketService'
+import planningStateService from './services/planningStateService'
 // Re-add static imports
 import express, { Request, Response } from 'express'
 import path from 'path'
@@ -17,6 +18,7 @@ import path from 'path'
 import { readTasks } from './lib/fsUtils'
 import { FEATURE_TASKS_DIR, UI_PORT } from './config'
 import { Task } from './models/types'
+import { detectClarificationRequest } from './lib/llmUtils'
 
 // Immediately log that we're starting up
 console.error('[TaskServer] LOG: Starting task manager server...')
@@ -36,6 +38,89 @@ console.error('[TaskServer] LOG: MCP Server instance created.')
 
 // --- Tool Definitions ---
 console.error('[TaskServer] LOG: Defining tools...')
+
+// New 'get_next_task' tool
+server.tool(
+  'get_next_task',
+  {
+    featureId: z
+      .string()
+      .uuid({ message: 'Valid feature ID (UUID) is required.' }),
+  },
+  async (args, _extra) => {
+    try {
+      const { featureId } = args
+      await logToFile(
+        `[TaskServer] Handling get_next_task request for feature: ${featureId}`
+      )
+
+      // 1. Read tasks for the given feature ID
+      const tasks = await readTasks(featureId)
+
+      if (tasks.length === 0) {
+        const message = `No tasks found for feature ID ${featureId}. The feature may not exist or has not been planned yet.`
+        await logToFile(`[TaskServer] ${message}`)
+        return {
+          content: [{ type: 'text', text: message }],
+          isError: false,
+        }
+      }
+
+      // 2. Find the first pending task in the list
+      const nextTask = tasks.find((task) => task.status === 'pending')
+
+      if (!nextTask) {
+        const message = `All tasks have been completed for feature ${featureId}.`
+        await logToFile(`[TaskServer] ${message}`)
+        return {
+          content: [{ type: 'text', text: message }],
+          isError: false,
+        }
+      }
+
+      // 3. Format response with task details
+      // Include effort in the message if available
+      const effortInfo = nextTask.effort ? ` (Effort: ${nextTask.effort})` : ''
+
+      // Include parent info if this is a subtask
+      let parentInfo = ''
+      if (nextTask.parentTaskId) {
+        // Find the parent task
+        const parentTask = tasks.find((t) => t.id === nextTask.parentTaskId)
+        if (parentTask) {
+          const parentDesc =
+            parentTask.description.length > 30
+              ? parentTask.description.substring(0, 30) + '...'
+              : parentTask.description
+          parentInfo = ` (Subtask of: "${parentDesc}")`
+        } else {
+          parentInfo = ` (Subtask of parent ID: ${nextTask.parentTaskId})` // Fallback if parent not found
+        }
+      }
+
+      // Embed ID, description, effort, and parent info in the text message
+      const message = `Next pending task (ID: ${nextTask.id})${effortInfo}${parentInfo}: ${nextTask.description}`
+
+      await logToFile(`[TaskServer] Found next task: ${nextTask.id}`)
+
+      return {
+        content: [{ type: 'text', text: message }],
+        isError: false,
+      }
+    } catch (error: any) {
+      const errorMsg = `Error processing get_next_task request: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+      console.error(`[TaskServer] ${errorMsg}`)
+      await logToFile(`[TaskServer] ${errorMsg}`)
+
+      return {
+        content: [{ type: 'text', text: errorMsg }],
+        isError: true,
+      }
+    }
+  }
+)
 
 // 1. Tool: mark_task_complete
 server.tool(
@@ -75,9 +160,11 @@ server.tool(
   async (args, _extra) => {
     const result = await handlePlanFeature(args)
     // Transform the content to match SDK expected format
+    // Since handlePlanFeature now always returns Array<{type: 'text', text: string}>
+    // we can use a simple map.
     return {
       content: result.content.map((item) => ({
-        type: item.type as 'text',
+        type: 'text',
         text: item.text,
       })),
       isError: result.isError,
@@ -262,6 +349,63 @@ async function main() {
         }
       })()
     })
+
+    // Get pending question for a specific feature
+    app.get(
+      '/api/features/:featureId/pending-question',
+      (req: Request, res: Response) => {
+        ;(async () => {
+          const { featureId } = req.params
+          try {
+            const state = planningStateService.getStateByFeatureId(featureId)
+            if (state && state.partialResponse) {
+              // Attempt to parse the stored partialResponse as JSON
+              let parsedData: any
+              try {
+                parsedData = JSON.parse(state.partialResponse)
+              } catch (parseError) {
+                logToFile(
+                  `[TaskServer] Error parsing partialResponse JSON for feature ${featureId}: ${parseError}. Content: ${state.partialResponse}`
+                )
+                res.json(null) // Cannot parse the stored state
+                return
+              }
+
+              // Check if the parsed data contains the clarificationNeeded structure
+              if (parsedData && parsedData.clarificationNeeded) {
+                const clarification = parsedData.clarificationNeeded
+                logToFile(
+                  `[TaskServer] Found pending question ${state.questionId} for feature ${featureId}`
+                )
+                res.json({
+                  questionId: state.questionId, // Use the ID from the stored state
+                  question: clarification.question,
+                  options: clarification.options,
+                  allowsText: clarification.allowsText,
+                })
+              } else {
+                logToFile(
+                  `[TaskServer] State found for feature ${featureId}, but partialResponse JSON did not contain 'clarificationNeeded'. Content: ${state.partialResponse}`
+                )
+                res.json(null) // Parsed data structure unexpected
+              }
+            } else {
+              logToFile(
+                `[TaskServer] No pending question found for feature ${featureId}`
+              )
+              res.json(null) // No pending question found
+            }
+          } catch (error: any) {
+            logToFile(
+              `[TaskServer] ERROR fetching pending question for feature ${featureId}: ${
+                error?.message || error
+              }`
+            )
+            res.status(500).json({ error: 'Failed to fetch pending question' })
+          }
+        })()
+      }
+    )
 
     // Default endpoint to get tasks from most recent feature
     app.get('/api/tasks', (req: Request, res: Response) => {

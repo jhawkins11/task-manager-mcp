@@ -15,9 +15,15 @@ import {
 import { aiService } from '../services/aiService' // Import aiService
 import webSocketService from '../services/webSocketService' // Import the service instance
 import { OPENROUTER_MODEL } from '../config' // Assuming model config is here
-import { ensureEffortRatings, processAndBreakdownTasks } from '../lib/llmUtils' // Import the refactored utils
+import {
+  ensureEffortRatings,
+  processAndBreakdownTasks,
+  detectClarificationRequest,
+  processAndFinalizePlan,
+} from '../lib/llmUtils' // Import the refactored utils
 import { GenerativeModel } from '@google/generative-ai' // Import types for model
 import OpenAI from 'openai' // Import OpenAI
+import planningStateService from '../services/planningStateService'
 
 // Placeholder for the actual prompt construction logic
 async function constructAdjustmentPrompt(
@@ -49,7 +55,21 @@ Output a *revised* and *complete* task list based on the adjustment request.
 The revised list should incorporate the requested changes (additions, removals, modifications, reordering).
 Maintain the same JSON format as the 'Current Task List' shown above.
 Ensure all tasks have necessary fields (id, description, status, effort, etc.). If IDs need regeneration, use UUID format. Preserve existing IDs where possible for unmodified tasks.
-Output *only* the JSON object containing the revised task list under the key 'tasks', like this: { "tasks": [...] }. Do not include any other text or explanations.
+Output *only* the JSON object containing the revised task list under the key 'tasks', like this: { "tasks": [...] }.
+
+IF YOU NEED CLARIFICATION BEFORE YOU CAN PROPERLY ADJUST THE PLAN:
+1. Instead of returning a task list, use the following format to ask for clarification:
+[CLARIFICATION_NEEDED]
+Your specific question here. Be precise about what information you need to proceed.
+Options: [Option A, Option B, Option C] (include this line only if providing multiple-choice options)
+MULTIPLE_CHOICE_ONLY (include this if only the listed options are valid, omit if free text is also acceptable)
+[END_CLARIFICATION]
+
+For example:
+[CLARIFICATION_NEEDED]
+Should the authentication system use JWT or session-based authentication?
+Options: [JWT, Session Cookies, OAuth2]
+[END_CLARIFICATION]
 `
   return prompt
 }
@@ -62,25 +82,31 @@ async function parseAndProcessLLMResponse(
   featureId: string,
   model: GenerativeModel | OpenAI | null // Pass the model instance
 ): Promise<Task[]> {
-  // Return type is Task[]
   console.log('Processing LLM response using refactored logic...')
   if (llmResult.success) {
+    // Check if tasks exist before accessing
+    if (!llmResult.data.tasks) {
+      console.error(
+        '[TaskServer] Error: parseAndProcessLLMResponse called but response contained clarificationNeeded instead of tasks.'
+      )
+      // Should not happen if adjustPlanHandler checks for clarification first, but handle defensively
+      throw new Error(
+        'parseAndProcessLLMResponse received clarification request, expected tasks.'
+      )
+    }
     // 1. Map LLM output to "[effort] description" strings
     const rawPlanSteps = llmResult.data.tasks.map(
       (task) => `[${task.effort}] ${task.description}`
     )
 
-    // 2. Ensure effort ratings (mostly for consistency check)
-    const effortRatedSteps = await ensureEffortRatings(rawPlanSteps, model)
-
-    // 3. Process breakdowns and create final Task objects
-    const { finalTasks } = await processAndBreakdownTasks(
-      effortRatedSteps,
+    // 2. Call the centralized function to process, finalize, save, and notify
+    const finalTasks = await processAndFinalizePlan(
+      rawPlanSteps,
       model,
       featureId
     )
 
-    // Validation is handled inside processAndBreakdownTasks, but we double-check the final output count
+    // Validation is handled inside processAndFinalizePlan, but we double-check the final output count
     if (finalTasks.length === 0 && rawPlanSteps.length > 0) {
       console.warn(
         '[TaskServer] Warning: LLM provided tasks, but processing resulted in an empty list.'
@@ -141,37 +167,70 @@ export async function adjustPlanHandler(
       { temperature: 0.3 } // Adjust parameters as needed
     )
 
-    // 4. Parse and process the structured response using the updated function
+    // Check for clarification requests in the LLM response
+    if (llmResult.rawResponse) {
+      const textContent = aiService.extractTextFromResponse(
+        llmResult.rawResponse
+      )
+      if (textContent) {
+        const clarificationCheck = detectClarificationRequest(textContent)
+
+        if (clarificationCheck.detected) {
+          // Store the intermediate state
+          const questionId = planningStateService.storeIntermediateState(
+            featureId,
+            prompt,
+            clarificationCheck.rawResponse,
+            'plan_adjustment'
+          )
+
+          // Send WebSocket message to UI asking for clarification
+          webSocketService.broadcast({
+            type: 'show_question',
+            featureId,
+            payload: {
+              questionId,
+              question: clarificationCheck.clarificationRequest.question,
+              options: clarificationCheck.clarificationRequest.options,
+              allowsText: clarificationCheck.clarificationRequest.allowsText,
+            },
+          })
+
+          // Record in history
+          await addHistoryEntry(featureId, 'tool_response', {
+            tool: 'adjust_plan',
+            status: 'awaiting_clarification',
+            questionId,
+          })
+
+          return {
+            status: 'awaiting_clarification',
+            message: `Plan adjustment paused for feature ${featureId}. User clarification needed via UI. Once submitted, call 'get_next_task' with featureId '${featureId}' to retrieve the first task.`,
+          }
+        }
+      }
+    }
+
+    // 4. Process the LLM response (this now handles finalization, saving, notification)
     const revisedTasks = await parseAndProcessLLMResponse(
       llmResult,
       featureId,
       planningModel
-    ) // Pass model
+    )
 
-    // 5. Overwrite the tasks file
-    await writeTasks(featureId, revisedTasks)
-    console.log(`Successfully overwrote tasks for feature ${featureId}`)
-
-    // 6. Add history entries
+    // 5. Add history entries (saving and notification are handled within parseAndProcessLLMResponse -> processAndFinalizePlan)
     await addHistoryEntry(
       featureId,
       'tool_call',
       `Adjust plan request: ${adjustment_request}`
     )
-    // Add a more informative tool_response entry
-    await addHistoryEntry(
-      featureId,
-      'tool_response',
-      llmResult.success
-        ? `Plan adjusted successfully. New task count: ${revisedTasks.length}`
-        : `Plan adjustment failed: ${llmResult.error}`
-    )
+    await addHistoryEntry(featureId, 'tool_response', {
+      tool: 'adjust_plan',
+      status: 'completed',
+      taskCount: revisedTasks.length,
+    })
 
-    // 7. Broadcast tasks_updated via WebSocketService
-    webSocketService.notifyTasksUpdated(featureId, revisedTasks)
-    console.log(`Broadcasted tasks_updated for feature ${featureId}`)
-
-    // 8. Return confirmation
+    // 6. Return confirmation
     return {
       status: 'success',
       message: `Successfully adjusted the plan for feature ${featureId}.`,
@@ -185,9 +244,14 @@ export async function adjustPlanHandler(
       featureId: featureId,
       payload: { code: 'PLAN_ADJUST_FAILED', message: error.message },
     })
+    await addHistoryEntry(featureId, 'tool_response', {
+      tool: 'adjust_plan',
+      status: 'failed',
+      error: error.message,
+    })
     return {
       status: 'error',
-      message: `Failed to adjust plan: ${error.message}`,
+      message: `Error adjusting plan: ${error.message}`,
     }
   }
 }

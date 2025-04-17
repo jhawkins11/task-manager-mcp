@@ -6,7 +6,24 @@ import {
   WebSocketMessageType,
   ClientRegistrationPayload,
   ErrorPayload,
+  ShowQuestionPayload,
+  QuestionResponsePayload,
+  PlanFeatureResponseSchema,
+  IntermediatePlanningState,
 } from '../models/types'
+import planningStateService from '../services/planningStateService'
+import { aiService } from '../services/aiService'
+import { OPENROUTER_MODEL, GEMINI_MODEL } from '../config'
+import { addHistoryEntry, writeTasks } from '../lib/fsUtils'
+import crypto from 'crypto'
+import {
+  processAndBreakdownTasks,
+  ensureEffortRatings,
+  processAndFinalizePlan,
+} from '../lib/llmUtils'
+import OpenAI from 'openai'
+import { GenerativeModel } from '@google/generative-ai'
+import { z } from 'zod'
 
 interface WebSocketConnection {
   socket: WebSocket
@@ -116,6 +133,15 @@ class WebSocketService {
         this.handleClientRegistration(
           socket,
           message.payload as ClientRegistrationPayload
+        )
+        return
+      }
+
+      // Handle question response
+      if (message.type === 'question_response' && message.payload) {
+        this.handleQuestionResponse(
+          message.featureId || '',
+          message.payload as QuestionResponsePayload
         )
         return
       }
@@ -368,17 +394,49 @@ class WebSocketService {
     featureId: string,
     questionId: string,
     question: string,
-    options?: string[]
+    options?: string[],
+    allowsText?: boolean
   ): void {
-    this.broadcast({
-      type: 'show_question',
-      featureId,
-      payload: {
-        questionId,
-        question,
-        options,
-      },
-    })
+    try {
+      if (!featureId || !questionId || !question) {
+        logToFile(
+          '[WebSocketService] Cannot send question: Missing required parameters'
+        )
+        return
+      }
+
+      // Check if any clients are connected for this feature
+      let featureClients = 0
+      for (const connection of this.connections.values()) {
+        if (connection.featureId === featureId) {
+          featureClients++
+        }
+      }
+
+      // Log if no clients are available
+      if (featureClients === 0) {
+        logToFile(
+          `[WebSocketService] Warning: Sending question ${questionId} to feature ${featureId} with no connected clients`
+        )
+      }
+
+      this.broadcast({
+        type: 'show_question',
+        featureId,
+        payload: {
+          questionId,
+          question,
+          options,
+          allowsText,
+        } as ShowQuestionPayload,
+      })
+
+      logToFile(
+        `[WebSocketService] Sent question to ${featureClients} clients for feature ${featureId}: ${question}`
+      )
+    } catch (error: any) {
+      logToFile(`[WebSocketService] Error sending question: ${error.message}`)
+    }
   }
 
   /**
@@ -397,6 +455,328 @@ class WebSocketService {
         target,
       },
     })
+  }
+
+  /**
+   * Handles user responses to questions
+   */
+  private async handleQuestionResponse(
+    featureId: string,
+    payload: QuestionResponsePayload
+  ): Promise<void> {
+    try {
+      if (!featureId) {
+        logToFile(
+          '[WebSocketService] Cannot handle question response: Missing featureId'
+        )
+        return
+      }
+
+      const { questionId, response } = payload
+
+      if (!questionId) {
+        logToFile(
+          '[WebSocketService] Cannot handle question response: Missing questionId'
+        )
+        this.broadcast({
+          type: 'error',
+          featureId,
+          payload: {
+            code: 'INVALID_RESPONSE',
+            message: 'Invalid response format: missing questionId',
+          } as ErrorPayload,
+        })
+        return
+      }
+
+      logToFile(
+        `[WebSocketService] Received response to question ${questionId}: ${response}`
+      )
+
+      // Get the stored planning state
+      const state = planningStateService.getStateByQuestionId(questionId)
+
+      if (!state) {
+        logToFile(
+          `[WebSocketService] No planning state found for question ${questionId}`
+        )
+        this.broadcast({
+          type: 'error',
+          featureId,
+          payload: {
+            code: 'QUESTION_EXPIRED',
+            message: 'The question session has expired or is invalid.',
+          } as ErrorPayload,
+        })
+        return
+      }
+
+      // Verify feature ID matches
+      if (state.featureId !== featureId) {
+        logToFile(
+          `[WebSocketService] Feature ID mismatch: question belongs to ${state.featureId}, but response came from ${featureId}`
+        )
+        this.broadcast({
+          type: 'error',
+          featureId,
+          payload: {
+            code: 'FEATURE_MISMATCH',
+            message:
+              'Response came from a different feature than the question.',
+          } as ErrorPayload,
+        })
+        return
+      }
+
+      // Add the response to history
+      await addHistoryEntry(featureId, 'user', {
+        questionId,
+        question: state.partialResponse,
+        response,
+      })
+
+      // Notify UI that response is being processed
+      this.broadcast({
+        type: 'status_changed',
+        featureId,
+        payload: {
+          status: 'processing_response',
+          questionId,
+        },
+      })
+
+      // Resume planning/adjustment with the user's response
+      try {
+        const planningModel = aiService.getPlanningModel()
+        if (!planningModel) {
+          throw new Error('Planning model not available')
+        }
+
+        logToFile(
+          `[WebSocketService] Resuming ${state.planningType} with user response for feature ${featureId}`
+        )
+
+        // Create a follow-up prompt including the original prompt and the user's answer
+        const followUpPrompt = `${state.prompt}\n\nUser clarification response: ${response}\n\nNow, please continue with the original task of planning the feature implementation steps.`
+
+        // Call the LLM with the follow-up prompt
+        if (planningModel instanceof OpenAI) {
+          await this.processOpenRouterResumeResponse(
+            planningModel,
+            followUpPrompt,
+            state,
+            featureId,
+            questionId
+          )
+        } else {
+          await this.processGeminiResumeResponse(
+            planningModel,
+            followUpPrompt,
+            state,
+            featureId,
+            questionId
+          )
+        }
+      } catch (error: any) {
+        logToFile(
+          `[WebSocketService] Error resuming planning: ${error.message}`
+        )
+
+        // Notify clients of the error
+        this.broadcast({
+          type: 'error',
+          featureId,
+          payload: {
+            code: 'RESUME_PLANNING_FAILED',
+            message: `Failed to process your response: ${error.message}`,
+          } as ErrorPayload,
+        })
+
+        // Add error history entry
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool:
+            state.planningType === 'feature_planning'
+              ? 'plan_feature'
+              : 'adjust_plan',
+          status: 'failed_after_clarification',
+          error: error.message,
+        })
+      }
+    } catch (error: any) {
+      logToFile(
+        `[WebSocketService] Unhandled error in question response handler: ${error.message}`
+      )
+      if (featureId) {
+        this.broadcast({
+          type: 'error',
+          featureId,
+          payload: {
+            code: 'INTERNAL_ERROR',
+            message:
+              'An internal error occurred while processing your response.',
+          } as ErrorPayload,
+        })
+      }
+    }
+  }
+
+  /**
+   * Process OpenRouter response for resuming planning after clarification
+   */
+  private async processOpenRouterResumeResponse(
+    model: OpenAI,
+    prompt: string,
+    state: IntermediatePlanningState,
+    featureId: string,
+    questionId: string
+  ): Promise<void> {
+    try {
+      logToFile(
+        `[WebSocketService] Calling OpenRouter with follow-up prompt for feature ${featureId}`
+      )
+
+      const result = await aiService.callOpenRouterWithSchema(
+        OPENROUTER_MODEL,
+        [{ role: 'user', content: prompt }],
+        PlanFeatureResponseSchema,
+        { temperature: 0.3 }
+      )
+
+      if (result.success) {
+        await this.processPlanningSuccess(
+          result.data,
+          model,
+          state,
+          featureId,
+          questionId
+        )
+      } else {
+        throw new Error(
+          `OpenRouter failed to generate a valid response: ${result.error}`
+        )
+      }
+    } catch (error: any) {
+      logToFile(
+        `[WebSocketService] Error in OpenRouter response processing: ${error.message}`
+      )
+      throw error // Re-throw to be handled by the caller
+    }
+  }
+
+  /**
+   * Process Gemini response for resuming planning after clarification
+   */
+  private async processGeminiResumeResponse(
+    model: GenerativeModel,
+    prompt: string,
+    state: IntermediatePlanningState,
+    featureId: string,
+    questionId: string
+  ): Promise<void> {
+    try {
+      logToFile(
+        `[WebSocketService] Calling Gemini with follow-up prompt for feature ${featureId}`
+      )
+
+      const result = await aiService.callGeminiWithSchema(
+        GEMINI_MODEL,
+        prompt,
+        PlanFeatureResponseSchema,
+        { temperature: 0.3 }
+      )
+
+      if (result.success) {
+        await this.processPlanningSuccess(
+          result.data,
+          model,
+          state,
+          featureId,
+          questionId
+        )
+      } else {
+        throw new Error(
+          `Gemini failed to generate a valid response: ${result.error}`
+        )
+      }
+    } catch (error: any) {
+      logToFile(
+        `[WebSocketService] Error in Gemini response processing: ${error.message}`
+      )
+      throw error // Re-throw to be handled by the caller
+    }
+  }
+
+  /**
+   * Process successful planning result after clarification
+   */
+  private async processPlanningSuccess(
+    data: z.infer<typeof PlanFeatureResponseSchema>,
+    model: GenerativeModel | OpenAI,
+    state: IntermediatePlanningState,
+    featureId: string,
+    questionId: string
+  ): Promise<void> {
+    try {
+      // Check if tasks exist before processing
+      if (!data.tasks) {
+        logToFile(
+          `[WebSocketService] Error: processPlanningSuccess called but response contained clarificationNeeded instead of tasks for feature ${featureId}`
+        )
+        // Optionally, you could try to handle the clarification again here, but throwing seems safer
+        throw new Error(
+          'processPlanningSuccess received clarification request, expected tasks.'
+        )
+      }
+
+      // Process the tasks using schema data
+      const rawPlanSteps = data.tasks.map(
+        (task: { effort: string; description: string }) =>
+          `[${task.effort}] ${task.description}`
+      )
+
+      // Log the result before detailed processing
+      await addHistoryEntry(featureId, 'model', {
+        step: 'resumed_planning_response',
+        response: JSON.stringify(data),
+      })
+
+      logToFile(
+        `[WebSocketService] Got ${rawPlanSteps.length} raw tasks after clarification for feature ${featureId}`
+      )
+
+      // Call the centralized processing function
+      const finalTasks = await processAndFinalizePlan(
+        rawPlanSteps,
+        model,
+        featureId
+      )
+
+      logToFile(
+        `[WebSocketService] Processed ${finalTasks.length} final tasks after clarification for feature ${featureId}`
+      )
+
+      // Clean up the temporary state
+      planningStateService.clearState(questionId)
+
+      // Add success history entry (notification/saving is now handled within processAndFinalizePlan)
+      await addHistoryEntry(featureId, 'tool_response', {
+        tool:
+          state.planningType === 'feature_planning'
+            ? 'plan_feature'
+            : 'adjust_plan',
+        status: 'completed_after_clarification',
+        taskCount: finalTasks.length,
+      })
+
+      logToFile(
+        `[WebSocketService] Successfully completed ${state.planningType} after clarification for feature ${featureId}`
+      )
+    } catch (error: any) {
+      logToFile(
+        `[WebSocketService] Error processing successful planning result: ${error.message}`
+      )
+      throw error // Re-throw to be handled by the caller
+    }
   }
 }
 

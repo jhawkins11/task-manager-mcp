@@ -160,6 +160,7 @@ export interface ShowQuestionPayload {
   questionId: string
   question: string
   options?: string[]
+  allowsText?: boolean
 }
 
 export interface QuestionResponsePayload {
@@ -196,8 +197,12 @@ export const TaskBreakdownResponseSchema = z.object({
       z.object({
         description: z.string().describe('Description of the subtask'),
         effort: z
-          .enum(['low', 'medium'])
-          .describe('Estimated effort level for the subtask'),
+          .string()
+          .transform((val) => val.toLowerCase())
+          .pipe(z.enum(['low', 'medium']))
+          .describe(
+            'Estimated effort level for the subtask (transformed to lowercase)'
+          ),
       })
     )
     .describe('List of smaller subtasks that make up the original task'),
@@ -205,21 +210,51 @@ export const TaskBreakdownResponseSchema = z.object({
 
 export type TaskBreakdownResponse = z.infer<typeof TaskBreakdownResponseSchema>
 
-// Schema for feature planning response used in planFeature.ts
-export const PlanFeatureResponseSchema = z.object({
-  tasks: z
-    .array(
-      z.object({
-        description: z
-          .string()
-          .describe('Detailed description of the coding task'),
-        effort: z
-          .enum(['low', 'medium', 'high'])
-          .describe('Estimated effort required for this task'),
-      })
-    )
-    .describe('List of ordered, sequential tasks for implementing the feature'),
+// Schema for LLM clarification request content (used within PlanFeatureResponseSchema)
+const ClarificationNeededSchema = z.object({
+  question: z.string().describe('The question text to display to the user'),
+  options: z
+    .array(z.string())
+    .optional()
+    .describe('Optional multiple choice options'),
+  allowsText: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('Whether free text response is allowed'),
 })
+
+// Schema for feature planning response used in planFeature.ts
+// Can now represent either a list of tasks OR a clarification request.
+export const PlanFeatureResponseSchema = z.union([
+  // Option 1: Successful plan with tasks
+  z.object({
+    tasks: z
+      .array(
+        z.object({
+          description: z
+            .string()
+            .describe('Detailed description of the coding task'),
+          effort: z
+            .enum(['low', 'medium', 'high'])
+            .describe('Estimated effort required for this task'),
+        })
+      )
+      // Ensure tasks array is not empty if provided
+      .min(1, { message: 'Tasks array cannot be empty if planning succeeded.' })
+      .describe(
+        'List of ordered, sequential tasks for implementing the feature'
+      ),
+    clarificationNeeded: z.undefined().optional(), // Ensure clarification is not present
+  }),
+  // Option 2: Clarification is needed
+  z.object({
+    tasks: z.undefined().optional(), // Ensure tasks are not present
+    clarificationNeeded: ClarificationNeededSchema.describe(
+      'Details of the clarification needed from the user'
+    ),
+  }),
+])
 
 export type PlanFeatureResponse = z.infer<typeof PlanFeatureResponseSchema>
 
@@ -235,3 +270,41 @@ export const AdjustPlanInputSchema = z.object({
 })
 
 export type AdjustPlanInput = z.infer<typeof AdjustPlanInputSchema>
+
+// Schema for LLM clarification request format
+export const LLMClarificationRequestSchema = z.object({
+  type: z
+    .literal('clarification_needed')
+    .describe('Indicates LLM needs clarification'),
+  question: z.string().describe('The question text to display to the user'),
+  options: z
+    .array(z.string())
+    .optional()
+    .describe('Optional multiple choice options'),
+  allowsText: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('Whether free text response is allowed'),
+})
+
+export type LLMClarificationRequest = z.infer<
+  typeof LLMClarificationRequestSchema
+>
+
+// Schema for storing intermediate planning state
+export const IntermediatePlanningStateSchema = z.object({
+  featureId: z.string().uuid().describe('The feature ID being planned'),
+  prompt: z.string().describe('The original prompt that led to the question'),
+  partialResponse: z
+    .string()
+    .describe("The LLM's partial response including the question"),
+  questionId: z.string().describe('ID of the clarification question'),
+  planningType: z
+    .enum(['feature_planning', 'plan_adjustment'])
+    .describe('Type of planning operation'),
+})
+
+export type IntermediatePlanningState = z.infer<
+  typeof IntermediatePlanningStateSchema
+>
