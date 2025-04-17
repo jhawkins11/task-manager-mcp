@@ -3,7 +3,9 @@
   "version": "1.1.0",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build:frontend && npm run build:server",
+    "build:server": "tsc",
+    "build:frontend": "cd frontend && npm install && npm run build && cd .. && mkdir -p dist/frontend-ui && cp -r frontend/build/* dist/frontend-ui/",
     "start": "node dist/server.js",
     "dev": "nodemon --watch src --ext ts --exec ts-node src/server.ts"
   },
@@ -15,16 +17,19 @@
     "@google/generative-ai": "^0.24.0",
     "@modelcontextprotocol/sdk": "^1.9.0",
     "@openrouter/ai-sdk-provider": "^0.4.5",
-    "@types/express": "^5.0.1",
+    "@types/express": "^4.17.21",
     "dotenv": "^16.5.0",
-    "express": "^5.1.0",
+    "express": "^4.21.2",
     "open": "^8.4.2",
     "openai": "^4.94.0",
+    "svelte": "^5.27.1",
     "tiktoken": "^1.0.20",
     "ws": "^8.16.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@sveltejs/adapter-auto": "^6.0.0",
+    "@sveltejs/kit": "^2.20.7",
     "@types/node": "^22.14.1",
     "@types/ws": "^8.5.10",
     "nodemon": "^3.1.9",

@@ -20,7 +20,7 @@ const FALLBACK_GEMINI_MODEL =
 const REVIEW_LLM_API_KEY = process.env.REVIEW_LLM_API_KEY || GEMINI_API_KEY
 
 // WebSocket server configuration
-const WS_PORT = parseInt(process.env.WS_PORT || '3000', 10)
+const WS_PORT = parseInt(process.env.WS_PORT || '4999', 10)
 const WS_HOST = process.env.WS_HOST || 'localhost'
 // UI server uses the same port as WebSocket
 const UI_PORT = WS_PORT

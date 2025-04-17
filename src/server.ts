@@ -2,11 +2,20 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import * as fsSync from 'fs'
+import * as fs from 'fs/promises'
 import { logToFile } from './lib/logger'
 import { handleMarkTaskComplete } from './tools/markTaskComplete'
 import { handlePlanFeature } from './tools/planFeature'
 import { handleReviewChanges } from './tools/reviewChanges'
 import webSocketService from './services/webSocketService'
+// Re-add static imports
+import express, { Request, Response } from 'express'
+import path from 'path'
+import open from 'open'
+
+import { readTasks } from './lib/fsUtils'
+import { FEATURE_TASKS_DIR, UI_PORT } from './config'
+import { Task } from './models/types'
 
 // Immediately log that we're starting up
 console.error('[TaskServer] LOG: Starting task manager server...')
@@ -133,11 +142,54 @@ process.on('unhandledRejection', (reason, promise) => {
   process.exit(1)
 })
 
+// Helper function to list all features
+async function listFeatures() {
+  try {
+    // Ensure features directory exists
+    await fs.mkdir(FEATURE_TASKS_DIR, { recursive: true })
+
+    // Read all files in the features directory
+    const files = await fs.readdir(FEATURE_TASKS_DIR)
+
+    // Filter for task files (ending with _mcp_tasks.json)
+    const taskFiles = files.filter((file) => file.endsWith('_mcp_tasks.json'))
+
+    // Extract feature IDs from filenames
+    const featureIds = taskFiles.map((file) =>
+      file.replace('_mcp_tasks.json', '')
+    )
+
+    return featureIds
+  } catch (error) {
+    console.error('[TaskServer] Error listing features:', error)
+    return []
+  }
+}
+
+// Helper function to format a task for the frontend
+function formatTaskForFrontend(task: Task, featureId: string) {
+  return {
+    ...task,
+    // Use task.title if available, otherwise fall back to description
+    title: task.title || task.description,
+    // Directly use the status from the task data, ensuring all statuses are handled
+    status: task.status,
+    // The 'completed' field should accurately reflect the 'completed' status
+    completed: task.status === 'completed',
+    feature_id: featureId,
+  }
+}
+
 // --- Server Start ---
 async function main() {
   await logToFile('[TaskServer] LOG: main() started.')
 
   try {
+    // --- Express Server Setup --- Moved inside main, after MCP connect
+    const app = express()
+    const PORT = process.env.PORT || UI_PORT || 4999
+
+    // --- MCP Server Connection --- Moved after Express init
     await logToFile('[TaskServer] LOG: Creating transport...')
     const transport = new StdioServerTransport()
     await logToFile('[TaskServer] LOG: Transport created.')
@@ -148,12 +200,123 @@ async function main() {
       '[TaskServer] LOG: MCP Task Manager Server connected and running on stdio...'
     )
 
-    // Initialize WebSocket service
+    // Setup API endpoints
+
+    // Get list of features
+    app.get('/api/features', (req: Request, res: Response) => {
+      ;(async () => {
+        try {
+          const featureIds = await listFeatures()
+          res.json(featureIds)
+        } catch (error: any) {
+          await logToFile(
+            `[TaskServer] ERROR fetching features: ${error?.message || error}`
+          )
+          res.status(500).json({ error: 'Failed to fetch features' })
+        }
+      })()
+    })
+
+    // Get tasks for a specific feature
+    app.get('/api/tasks/:featureId', (req: Request, res: Response) => {
+      ;(async () => {
+        const { featureId } = req.params
+        try {
+          const tasks = await readTasks(featureId)
+
+          // Use the helper function to format tasks
+          const formattedTasks = tasks.map((task) =>
+            formatTaskForFrontend(task, featureId)
+          )
+
+          res.json(formattedTasks)
+        } catch (error: any) {
+          await logToFile(
+            `[TaskServer] ERROR fetching tasks for feature ${featureId}: ${
+              error?.message || error
+            }`
+          )
+          res.status(500).json({ error: 'Failed to fetch tasks' })
+        }
+      })()
+    })
+
+    // Default endpoint to get tasks from most recent feature
+    app.get('/api/tasks', (req: Request, res: Response) => {
+      ;(async () => {
+        try {
+          const featureIds = await listFeatures()
+
+          if (featureIds.length === 0) {
+            // Return empty array if no features exist
+            return res.json([])
+          }
+
+          // Sort feature IDs by creation time (using file stats)
+          const featuresWithStats = await Promise.all(
+            featureIds.map(async (featureId) => {
+              const filePath = path.join(
+                FEATURE_TASKS_DIR,
+                `${featureId}_mcp_tasks.json`
+              )
+              const stats = await fs.stat(filePath)
+              return { featureId, mtime: stats.mtime }
+            })
+          )
+
+          // Sort by most recent modification time
+          featuresWithStats.sort(
+            (a, b) => b.mtime.getTime() - a.mtime.getTime()
+          )
+
+          // Get tasks for the most recent feature
+          const mostRecentFeatureId = featuresWithStats[0].featureId
+          const tasks = await readTasks(mostRecentFeatureId)
+
+          // Use the helper function to format tasks
+          const formattedTasks = tasks.map((task) =>
+            formatTaskForFrontend(task, mostRecentFeatureId)
+          )
+
+          res.json(formattedTasks)
+        } catch (error: any) {
+          await logToFile(
+            `[TaskServer] ERROR fetching default tasks: ${
+              error?.message || error
+            }`
+          )
+          res.status(500).json({ error: 'Failed to fetch tasks' })
+        }
+      })()
+    })
+
+    // Serve static frontend files
+    const staticFrontendPath = path.join(__dirname, 'frontend-ui')
+    app.use(express.static(staticFrontendPath))
+
+    // Catch-all route to serve the SPA for any unmatched routes
+    app.get('*', (req: Request, res: Response) => {
+      res.sendFile(path.join(staticFrontendPath, 'index.html'))
+    })
+
+    // Start the Express server and capture the HTTP server instance
+    const httpServer = app.listen(PORT, () => {
+      const url = `http://localhost:${PORT}`
+      console.error(`[TaskServer] LOG: Frontend server running at ${url}`)
+
+      // Automatically open browser when started - REMOVED
+      /* try {
+        open(url)
+      } catch (err) {
+        console.error('[TaskServer] WARN: Failed to open browser:', err)
+      } */
+    })
+
+    // Initialize WebSocket service with the HTTP server instance
     try {
-      await logToFile('[TaskServer] LOG: Initializing WebSocket server...')
-      await webSocketService.initialize()
+      await webSocketService.initialize(httpServer)
       await logToFile(
-        '[TaskServer] LOG: WebSocket server initialized successfully.'
+        '[TaskServer] LOG: WebSocket server attached to HTTP server.'
       )
     } catch (wsError) {
       await logToFile(
@@ -163,8 +326,7 @@ async function main() {
         '[TaskServer] WARN: WebSocket server initialization failed:',
         wsError
       )
-      // Continue execution even if WebSocket server fails
-      // This ensures MCP functionality works even without real-time UI updates
+      // Decide if this is fatal or can continue
     }
 
     // Handle process termination gracefully

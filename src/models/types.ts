@@ -3,10 +3,15 @@ import { z } from 'zod'
 // --- Zod Schemas ---
 export const TaskSchema = z.object({
   id: z.string().uuid(),
-  status: z.enum(['pending', 'completed']),
+  title: z.string().optional(),
   description: z.string(),
+  status: z.enum(['pending', 'in_progress', 'completed']),
+  completed: z.boolean().default(false),
   effort: z.enum(['low', 'medium', 'high']).optional(),
+  feature_id: z.string().uuid().optional(),
   parentTaskId: z.string().uuid().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
 })
 
 export const TaskListSchema = z.array(TaskSchema)
@@ -147,7 +152,7 @@ export interface TasksUpdatedPayload {
 
 export interface StatusChangedPayload {
   taskId: string
-  status: 'pending' | 'completed'
+  status: 'pending' | 'in_progress' | 'completed'
   updatedAt: string
 }
 

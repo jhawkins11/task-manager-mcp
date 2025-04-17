@@ -593,11 +593,14 @@ export async function handlePlanFeature(
         const taskId =
           complexTaskMap.get(cleanDescription) || crypto.randomUUID()
 
+        const status = isParentContainer ? 'completed' : 'pending'
+
         return {
           id: taskId,
-          status: isParentContainer ? 'completed' : 'pending', // Mark containers as completed
+          status,
           description: cleanDescription,
-          effort: effort,
+          effort,
+          completed: status === 'completed', // Add completed flag based on status
           ...(parentTaskId && { parentTaskId }),
         }
       })

@@ -1,5 +1,5 @@
 import { WebSocket, WebSocketServer } from 'ws'
-import { WS_PORT, WS_HOST } from '../config'
+import { UI_PORT } from '../config'
 import { logToFile } from '../lib/logger'
 import {
   WebSocketMessage,
@@ -34,9 +34,11 @@ class WebSocketService {
   }
 
   /**
-   * Initializes the WebSocket server
+   * Initializes the WebSocket server using an existing HTTP server
+   *
+   * @param httpServer The Node.js HTTP server instance from Express
    */
-  public async initialize(): Promise<void> {
+  public async initialize(httpServer: import('http').Server): Promise<void> {
     if (this.isInitialized) {
       await logToFile(
         '[WebSocketService] WebSocket server already initialized.'
@@ -45,13 +47,12 @@ class WebSocketService {
     }
 
     try {
-      this.wss = new WebSocketServer({
-        port: WS_PORT,
-        host: WS_HOST,
-      })
+      // Attach WebSocket server to the existing HTTP server
+      this.wss = new WebSocketServer({ server: httpServer })
 
+      // Use UI_PORT for logging consistency if needed
       await logToFile(
-        `[WebSocketService] WebSocket server started on ${WS_HOST}:${WS_PORT}`
+        `[WebSocketService] WebSocket server attached to HTTP server on port ${UI_PORT}`
       )
 
       this.wss.on('connection', this.handleConnection.bind(this))
