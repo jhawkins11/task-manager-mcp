@@ -73,7 +73,7 @@ class WebSocketService {
   /**
    * Handles new WebSocket connections
    */
-  private handleConnection(socket: WebSocket, request: any): void {
+  private handleConnection(socket: WebSocket, _request: any): void {
     // Create a new connection entry
     const connection: WebSocketConnection = {
       socket,

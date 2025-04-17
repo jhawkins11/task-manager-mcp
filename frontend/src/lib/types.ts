@@ -44,3 +44,23 @@ export enum TaskEffort {
   MEDIUM = 'medium',
   HIGH = 'high',
 }
+
+// --- Frontend Specific Types ---
+
+// Mirror the backend WebSocket message structure
+export type WebSocketMessageType =
+  | 'tasks_updated'
+  | 'status_changed'
+  | 'show_question'
+  | 'question_response'
+  | 'request_screenshot'
+  | 'request_screenshot_ack'
+  | 'error'
+  | 'connection_established'
+  | 'client_registration'
+
+export interface WebSocketMessage {
+  type: WebSocketMessageType
+  featureId?: string
+  payload?: any // Keep payload generic for now, specific handlers will parse
+}

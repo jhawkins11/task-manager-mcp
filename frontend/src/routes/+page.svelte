@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
-	import { fade } from 'svelte/transition';
+	import { fade } from 'svelte/transition'; 
 	import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '$lib/components/ui/card';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
@@ -9,30 +9,124 @@
 	import * as Select from '$lib/components/ui/select';
 	import { Progress } from '$lib/components/ui/progress';
 	import { Loader2 } from 'lucide-svelte';
-	import type { Task } from '$lib/types';
+	import type { Task, WebSocketMessage } from '$lib/types'; // Import WebSocketMessage type
 	import { TaskStatus, TaskEffort } from '$lib/types';
 	import type { Selected } from 'bits-ui';
 
 	let tasks: Task[] = [];
 	let nestedTasks: Task[] = [];
 	let loading = true;
-	let error: string | null = null;
+	let error: string | null = null; 
 	let featureId: string | null = null;
 	let features: string[] = [];
 	let loadingFeatures = true;
-	let loadingRefresh = false;
+	// let loadingRefresh = false; // Can likely remove this
+	// let pollingIntervalId: number | null = null; // Remove polling variable
+	let ws: WebSocket | null = null;
+	let wsStatus: 'connecting' | 'connected' | 'disconnected' = 'disconnected';
 
-	// Function to fetch tasks, optionally for a specific feature
+	// --- WebSocket Functions ---
+	function connectWebSocket() {
+		// Construct WebSocket URL (ws:// or wss:// based on protocol)
+		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const wsUrl = `${protocol}//${window.location.host}`;
+		
+		console.log(`[WS Client] Attempting to connect to ${wsUrl}...`);
+		wsStatus = 'connecting';
+		ws = new WebSocket(wsUrl);
+
+		ws.onopen = () => {
+			console.log('[WS Client] WebSocket connection established.');
+			wsStatus = 'connected';
+			// Register this client for the current feature
+			if (featureId && ws) {
+				sendWsMessage({ 
+					type: 'client_registration', 
+					featureId: featureId,
+					payload: { featureId: featureId, clientId: `browser-${Date.now()}` } // Basic client ID
+				});
+			}
+		};
+
+		ws.onmessage = (event) => {
+			try {
+				const message: WebSocketMessage = JSON.parse(event.data);
+				console.log('[WS Client] Received message:', message);
+
+				// Check if the message is for the currently viewed feature
+				if (message.featureId && message.featureId !== featureId) {
+					console.log('[WS Client] Ignoring message for different feature:', message.featureId);
+					return;
+				}
+
+				switch (message.type) {
+					case 'tasks_updated':
+					case 'status_changed': // Refresh on status change too
+						console.log(`[WS Client] Received ${message.type}, refreshing tasks for feature ${featureId}...`);
+						refreshTasks(); // Re-fetch tasks for the current feature
+						break;
+					case 'error':
+						console.error('[WS Client] Received error message:', message.payload);
+						// Optionally display a user-facing error
+						break;
+					case 'connection_established':
+						console.log('[WS Client] Server confirmed connection.');
+						break;
+					case 'client_registration':
+						console.log('[WS Client] Server confirmed registration:', message.payload);
+						break;
+					// Add other message type handlers if needed
+				}
+			} catch (e) {
+				console.error('[WS Client] Error processing message:', e);
+			}
+		};
+
+		ws.onerror = (error) => {
+			console.error('[WS Client] WebSocket error:', error);
+			wsStatus = 'disconnected';
+			// Optionally add more robust error handling or reconnection attempts
+		};
+
+		ws.onclose = (event) => {
+			console.log(`[WS Client] WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`);
+			wsStatus = 'disconnected';
+			ws = null;
+			// Attempt to reconnect after a delay?
+			// setTimeout(connectWebSocket, 5000); // Example: Try reconnecting after 5 seconds
+		};
+	}
+
+	function sendWsMessage(message: WebSocketMessage) {
+		if (ws && ws.readyState === WebSocket.OPEN) {
+			try {
+				ws.send(JSON.stringify(message));
+				console.log('[WS Client] Sent message:', message);
+			} catch (e) {
+				console.error('[WS Client] Error sending message:', e);
+			}
+		} else {
+			console.warn('[WS Client] Cannot send message, WebSocket not open.');
+		}
+	}
+
+	// --- Component Lifecycle & Data Fetching ---
+
 	async function fetchTasks(selectedFeatureId?: string) {
 		loading = true;
-		error = null;
+		error = '';
 		
 		try {
-			const featureParam = selectedFeatureId ? `?featureId=${encodeURIComponent(selectedFeatureId)}` : '';
-			const response = await fetch(`/api/tasks${featureParam}`);
+			// Construct the API endpoint based on whether we have a featureId
+			const endpoint = selectedFeatureId 
+				? `/api/tasks/${selectedFeatureId}` 
+				: '/api/tasks';
+			
+			const response = await fetch(endpoint);
 			if (!response.ok) {
-				throw new Error(`HTTP error! status: ${response.status}`);
+				throw new Error(`Failed to fetch tasks: ${response.statusText}`);
 			}
+			
 			const data = await response.json();
 			
 			// Convert API response to our Task type
@@ -70,31 +164,24 @@
 					completed,
 					effort,
 					feature_id: task.feature_id || selectedFeatureId || undefined,
-					parentTaskId: task.parentTaskId || null,
+					parentTaskId: task.parentTaskId,
 					createdAt: task.createdAt,
 					updatedAt: task.updatedAt
 				} as Task;
 			});
 			
-			// Process into nested structure
-			processNestedTasks();
-			
-			if (tasks.length === 0 && !selectedFeatureId) {
-				error = 'No features or tasks found. Create a feature first.';
-			} else if (tasks.length === 0 && selectedFeatureId) {
+			if (tasks.length === 0) {
 				error = 'No tasks found for this feature.';
 			}
-		} catch (e: any) {
-			error = e.message || 'Failed to fetch tasks';
-			console.error('Error fetching tasks:', e);
-			tasks = [];
-			nestedTasks = [];
+		} catch (err) {
+			error = err instanceof Error ? err.message : 'An error occurred';
+			console.error('Error fetching tasks:', err);
+			tasks = []; // Clear any previous tasks
 		} finally {
 			loading = false;
 		}
 	}
 
-	// Fetch the list of available features
 	async function fetchFeatures() {
 		loadingFeatures = true;
 		try {
@@ -118,46 +205,77 @@
 		// Fetch features first
 		await fetchFeatures();
 		
-		// If no featureId in URL and features exist, try to get default tasks
+		// Initial task fetch logic (remains the same)
 		if (!featureId && features.length > 0) {
-			await fetchTasks(); // Fetch default (most recent)
-			// If default tasks were fetched, update featureId to match
+			await fetchTasks(); 
 			if (tasks.length > 0 && tasks[0].feature_id) {
 				featureId = tasks[0].feature_id;
 			}
 		} else if (featureId) {
-			// If featureId is in URL, fetch specifically for it
 			await fetchTasks(featureId);
 		} else {
-			// No featureId, no features found, or default fetch failed
-			loading = false; // Ensure loading stops
-			if (!error) { // Avoid overwriting existing fetch errors
+			loading = false; 
+			if (!error) { 
 				error = 'No features found. Create a feature first using the task manager CLI.';
 			}
 		}
+
+		// Connect WebSocket AFTER initial data load and featureId determination
+		connectWebSocket();
+
+		// Remove polling logic
+		/*
+		pollingIntervalId = window.setInterval(() => {
+			if (!loading) {
+				console.log('Polling for task updates...');
+				refreshTasks();
+			}
+		}, 10000);
+		*/
+	});
+
+	onDestroy(() => {
+		// Clean up WebSocket connection
+		if (ws) {
+			console.log('[WS Client] Closing WebSocket connection.');
+			ws.close();
+			ws = null;
+		}
+
+		// Remove polling cleanup
+		/*
+		if (pollingIntervalId) {
+			clearInterval(pollingIntervalId);
+			console.log('Cleared task polling interval.'); 
+		}
+		*/
 	});
 
 	function toggleTaskStatus(taskId: string) {
+		// The UI update happens optimistically as before
 		const taskIndex = tasks.findIndex((t) => t.id === taskId);
 		if (taskIndex !== -1) {
 			const task = tasks[taskIndex];
 			const newStatus = task.status === TaskStatus.COMPLETED ? TaskStatus.PENDING : TaskStatus.COMPLETED;
 			tasks[taskIndex].status = newStatus;
 			tasks[taskIndex].completed = newStatus === TaskStatus.COMPLETED;
-			tasks = [...tasks]; // Trigger reactivity for flat list
-			processNestedTasks(); // Re-process nested structure after status change
+			tasks = [...tasks];
+			processNestedTasks();
 		}
+		// NOTE: We no longer need to manually trigger a backend update here 
+		// if the external 'mark_complete' tool is the source of truth for completion.
+		// If toggling the checkbox *should* also update the backend, 
+		// we'd need a separate fetch call here, and the backend should broadcast.
 	}
 
-	// Define badge variants for dark mode aesthetics
 	function getEffortBadgeVariant(effort: string) {
 		switch (effort) {
 			case TaskEffort.LOW:
-				return 'secondary'; // Subtle
+				return 'secondary';
 			case TaskEffort.MEDIUM:
-				return 'outline'; // Outline stands out well
+				return 'default';
 			case TaskEffort.HIGH:
-				return 'destructive'; // Keep destructive for high importance
+				return 'destructive';
 			default:
 				return 'outline';
 		}
@@ -166,35 +284,16 @@
 	function getStatusBadgeVariant(status: string) {
 		switch (status) {
 			case TaskStatus.COMPLETED:
-				return 'secondary'; // Completed tasks less prominent
+				return 'secondary';
 			case TaskStatus.IN_PROGRESS:
-				return 'default'; // Default/Primary for active tasks
+				return 'default';
 			case TaskStatus.PENDING:
-				return 'outline'; // Outline for pending
+				return 'outline';
 			default:
 				return 'outline';
 		}
 	}
 
-	function refreshTasks() {
-		fetchTasks(featureId || undefined);
-	}
-
-	function handleFeatureChange(selectedItem: Selected<string> | undefined) {
-		if (selectedItem) {
-			const newFeatureId = selectedItem.value;
-			featureId = newFeatureId;
-			// Update URL without refreshing the page
-			const url = new URL(window.location.href);
-			url.searchParams.set('featureId', newFeatureId);
-			window.history.pushState({}, '', url);
-			
-			// Fetch tasks for the new feature
-			fetchTasks(newFeatureId);
-		}
-	}
-
-	// New function to create the nested task structure
 	function processNestedTasks() {
 		// Define the type for map values explicitly
 		type TaskWithChildren = Task & { children: Task[] };
@@ -204,12 +303,10 @@
 		);
 		const rootTasks: Task[] = [];
 
-		taskMap.forEach((task: TaskWithChildren) => { // Explicitly type the task variable
+		taskMap.forEach((task: TaskWithChildren) => { 
 			if (task.parentTaskId && taskMap.has(task.parentTaskId)) {
 				const parent = taskMap.get(task.parentTaskId);
 				if (parent) {
-					// Now parent.children is correctly typed as Task[]
-					// and task is correctly typed as TaskWithChildren (which extends Task)
 					parent.children.push(task);
 				} else {
 					rootTasks.push(task);
@@ -226,6 +323,38 @@
 		nestedTasks = rootTasks;
 	}
 
+	function refreshTasks() {
+		if (loading) return;
+		console.log('[Task List] Refreshing tasks...') 
+		fetchTasks(featureId || undefined);
+	}
+
+	function handleFeatureChange(selectedItem: Selected<string> | undefined) {
+		const newFeatureId = selectedItem?.value; // Safely get value
+		
+		if (newFeatureId && newFeatureId !== featureId) { 
+			featureId = newFeatureId;
+			
+			// Update URL 
+			const url = new URL(window.location.href);
+			url.searchParams.set('featureId', newFeatureId);
+			window.history.pushState({}, '', url);
+			
+			// Fetch tasks for the new feature
+			fetchTasks(newFeatureId);
+
+			// Re-register WebSocket for the new feature
+			if (ws && wsStatus === 'connected') {
+				sendWsMessage({ 
+					type: 'client_registration', 
+					featureId: featureId,
+					payload: { featureId: featureId, clientId: `browser-${Date.now()}` }
+				});
+			}
+		}
+	}
+
+	// ... reactive variables ...
 	$: completedCount = tasks.filter(t => t.completed).length;
 	$: totalTasks = tasks.length;
 	$: progress = totalTasks > 0 ? (completedCount / totalTasks) * 100 : 0;
@@ -456,10 +585,9 @@
 		}
 	}
 
-	/* Additional styles can be added here if needed */
-	/* Ensure task rows handle overflow for the shine */
 	.task-row {
 		position: relative; /* Needed for absolute positioning of ::before */
 		overflow: hidden; /* Keep shine contained */
 	}
 </style>
+

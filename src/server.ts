@@ -11,7 +11,6 @@ import webSocketService from './services/webSocketService'
 // Re-add static imports
 import express, { Request, Response } from 'express'
 import path from 'path'
-import open from 'open'
 
 import { readTasks } from './lib/fsUtils'
 import { FEATURE_TASKS_DIR, UI_PORT } from './config'
