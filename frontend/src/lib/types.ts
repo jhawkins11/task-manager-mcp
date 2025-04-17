@@ -5,7 +5,7 @@ export interface Task {
   id: string
   title: string
   description?: string
-  status: 'pending' | 'in_progress' | 'completed'
+  status: TaskStatus
   completed: boolean
   effort: 'low' | 'medium' | 'high'
   feature_id?: string
@@ -34,6 +34,7 @@ export enum TaskStatus {
   PENDING = 'pending',
   IN_PROGRESS = 'in_progress',
   COMPLETED = 'completed',
+  DECOMPOSED = 'decomposed',
 }
 
 /**

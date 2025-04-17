@@ -520,7 +520,8 @@ export async function processAndBreakdownTasks(
           complexTaskMap.get(originalHighEffortDesc)) ||
         crypto.randomUUID()
 
-      const status = isParentContainer ? 'completed' : 'pending'
+      // If it's a parent container, set status to 'decomposed', otherwise 'pending'
+      const status = isParentContainer ? 'decomposed' : 'pending'
 
       const taskData = {
         id: taskId,
@@ -528,7 +529,8 @@ export async function processAndBreakdownTasks(
         status,
         description: cleanDescription,
         effort: validatedEffort,
-        completed: status === 'completed',
+        // Decomposed tasks are not considered 'completed' in the traditional sense
+        completed: false,
         ...(parentTaskId && { parentTaskId }),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),

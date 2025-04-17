@@ -112,13 +112,18 @@ export async function handleMarkTaskComplete(
         )
 
         if (allSubtasksComplete) {
-          // Auto-complete the parent task
+          // Auto-update the parent task status to 'decomposed'
           const finalTasks = updatedTasks.map((task) => {
             if (task.id === parentTaskId) {
               console.error(
-                `[TaskServer] Auto-completing parent task ${parentTaskId} as all subtasks are complete.`
+                `[TaskServer] Setting parent task ${parentTaskId} to 'decomposed' as all subtasks are complete.`
               )
-              return { ...task, status: 'completed' as const }
+              // Parent is decomposed, not completed
+              return {
+                ...task,
+                status: 'decomposed' as const,
+                completed: false,
+              }
             }
             return task
           })
@@ -131,12 +136,12 @@ export async function handleMarkTaskComplete(
             webSocketService.notifyTaskStatusChanged(
               feature_id,
               task_id,
-              'completed'
+              'completed' // The subtask itself is completed
             )
             webSocketService.notifyTaskStatusChanged(
               feature_id,
               parentTaskId!,
-              'completed'
+              'decomposed' // Parent is now decomposed
             )
             await logToFile(
               `[TaskServer] Broadcast tasks_updated and status_changed events for feature ${feature_id}`
@@ -149,18 +154,18 @@ export async function handleMarkTaskComplete(
           }
 
           await logToFile(
-            `[TaskServer] Task ${task_id} and parent task marked as complete.`
+            `[TaskServer] Task ${task_id} marked as complete. Parent task ${parentTaskId} status set to decomposed.`
           )
-          message = `Task ${task_id} marked as complete. Parent task ${parentTaskId} also auto-completed as all subtasks are now complete.`
+          message = `Task ${task_id} marked as complete. Parent task ${parentTaskId} status updated as all subtasks are now complete.`
 
-          // Record success with parent completion in history
+          // Record success with parent update in history
           await addHistoryEntry(feature_id, 'tool_response', {
             tool: 'mark_task_complete',
             isError: false,
             message,
             taskId: task_id,
             parentTaskId,
-            status: 'completed_with_parent',
+            status: 'completed_with_parent_decomposed', // Updated status key
           })
 
           // Now find the next task (using the finalTasks list)

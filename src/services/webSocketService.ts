@@ -374,7 +374,7 @@ class WebSocketService {
   public notifyTaskStatusChanged(
     featureId: string,
     taskId: string,
-    status: 'pending' | 'completed'
+    status: 'pending' | 'completed' | 'decomposed'
   ): void {
     this.broadcast({
       type: 'status_changed',

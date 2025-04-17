@@ -5,7 +5,7 @@ export const TaskSchema = z.object({
   id: z.string().uuid(),
   title: z.string().optional(),
   description: z.string(),
-  status: z.enum(['pending', 'in_progress', 'completed']),
+  status: z.enum(['pending', 'in_progress', 'completed', 'decomposed']),
   completed: z.boolean().default(false),
   effort: z.enum(['low', 'medium', 'high']).optional(),
   feature_id: z.string().uuid().optional(),
@@ -152,7 +152,7 @@ export interface TasksUpdatedPayload {
 
 export interface StatusChangedPayload {
   taskId: string
-  status: 'pending' | 'in_progress' | 'completed'
+  status: 'pending' | 'in_progress' | 'completed' | 'decomposed'
   updatedAt: string
 }
 

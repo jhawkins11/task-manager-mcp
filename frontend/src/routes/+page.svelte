@@ -8,7 +8,7 @@
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Select from '$lib/components/ui/select';
 	import { Progress } from '$lib/components/ui/progress';
-	import { Loader2 } from 'lucide-svelte';
+	import { Loader2, CornerDownLeft, CornerDownRight } from 'lucide-svelte';
 	import { writable, type Writable } from 'svelte/store';
 	import type { Task, WebSocketMessage, ShowQuestionPayload, QuestionResponsePayload } from '$lib/types';
 	import { TaskStatus, TaskEffort } from '$lib/types';
@@ -29,6 +29,33 @@
 	// Question modal state
 	let showQuestionModal = false;
 	let questionData: ShowQuestionPayload | null = null;
+
+	// Reactive statement to update nestedTasks when tasks store changes
+	$: {
+		const taskMap = new Map<string, Task & { children: Task[] }>();
+		const rootTasks: Task[] = [];
+
+		// Use the tasks from the store ($tasks)
+		$tasks.forEach(task => {
+			// Ensure the task object has the correct type including children array
+			const taskWithChildren: Task & { children: Task[] } = {
+				...task,
+				children: []
+			};
+			taskMap.set(task.id, taskWithChildren);
+		});
+
+		$tasks.forEach(task => {
+			const currentTask = taskMap.get(task.id)!; // Should always exist
+			if (task.parentTaskId && taskMap.has(task.parentTaskId)) {
+				taskMap.get(task.parentTaskId)!.children.push(currentTask);
+			} else {
+				rootTasks.push(currentTask);
+			}
+		});
+
+		nestedTasks = rootTasks;
+	}
 
 	// --- WebSocket Functions ---
 	function connectWebSocket() {
@@ -78,10 +105,24 @@
 					case 'status_changed':
 						console.log(`[WS Client] Received status_changed for task ${message.payload?.taskId}`);
 						if (message.payload?.taskId && message.payload?.status) {
+							// Map incoming status string to TaskStatus enum
+							let newStatus: TaskStatus;
+							switch (message.payload.status) {
+								case 'completed': newStatus = TaskStatus.COMPLETED; break;
+								case 'in_progress': newStatus = TaskStatus.IN_PROGRESS; break;
+								case 'decomposed': newStatus = TaskStatus.DECOMPOSED; break;
+								default: newStatus = TaskStatus.PENDING; break;
+							}
+							
 							tasks.update(currentTasks =>
 								currentTasks.map(task =>
 									task.id === message.payload.taskId
-										? { ...task, status: message.payload.status, completed: message.payload.status === 'completed' }
+										? { 
+											...task, 
+											status: newStatus, 
+											// Completed is true ONLY if status is COMPLETED
+											completed: newStatus === TaskStatus.COMPLETED 
+										  }
 										: task
 								)
 							);
@@ -166,14 +207,13 @@
 			
 			// Convert API response to our Task type
 			const mappedData = data.map((task: any) => {
-				// Ensure status is one of our enum values
+				// Map incoming status string to TaskStatus enum
 				let status: TaskStatus;
-				if (task.status === 'completed') {
-					status = TaskStatus.COMPLETED;
-				} else if (task.status === 'in_progress') {
-					status = TaskStatus.IN_PROGRESS;
-				} else {
-					status = TaskStatus.PENDING;
+				switch (task.status) {
+					case 'completed': status = TaskStatus.COMPLETED; break;
+					case 'in_progress': status = TaskStatus.IN_PROGRESS; break;
+					case 'decomposed': status = TaskStatus.DECOMPOSED; break;
+					default: status = TaskStatus.PENDING; break;
 				}
 				
 				// Ensure effort is one of our enum values
@@ -359,14 +399,15 @@
 		}
 	}
 
-	function getStatusBadgeVariant(status: string) {
+	function getStatusBadgeVariant(status: TaskStatus): 'default' | 'secondary' | 'destructive' | 'outline' {
 		switch (status) {
 			case TaskStatus.COMPLETED:
 				return 'secondary';
 			case TaskStatus.IN_PROGRESS:
 				return 'default';
-			case TaskStatus.PENDING:
+			case TaskStatus.DECOMPOSED:
 				return 'outline';
+			case TaskStatus.PENDING:
 			default:
 				return 'outline';
 		}
@@ -462,9 +503,11 @@
 	}
 
 	// ... reactive variables ...
-	$: completedCount = $tasks.filter(t => t.completed).length;
-	$: totalTasks = $tasks.length;
-	$: progress = totalTasks > 0 ? (completedCount / totalTasks) * 100 : 0;
+	// Filter out decomposed tasks from progress calculation
+	$: actionableTasks = $tasks.filter(t => t.status !== TaskStatus.DECOMPOSED);
+	$: completedCount = actionableTasks.filter(t => t.completed).length;
+	$: totalActionableTasks = actionableTasks.length;
+	$: progress = totalActionableTasks > 0 ? (completedCount / totalActionableTasks) * 100 : 0;
 	$: firstPendingTaskIndex = $tasks.findIndex(t => t.status === TaskStatus.PENDING);
 	$: selectedFeatureLabel = features.find(f => f === featureId) || 'Select Feature';
 
@@ -537,16 +580,21 @@
 						{@const taskIndexInFlatList = $tasks.findIndex(t => t.id === task.id)}
 						{@const isNextPending = taskIndexInFlatList === firstPendingTaskIndex}
 						{@const isInProgress = task.status === TaskStatus.IN_PROGRESS}
+						{@const areAllChildrenComplete = task.children && task.children.length > 0 && task.children.every(c => c.status === TaskStatus.COMPLETED)}
 						<div 
 							transition:fade={{ duration: 200 }}
 							class="task-row flex items-start space-x-4 p-4 hover:bg-muted/50 transition-colors 
 								   {isNextPending ? 'bg-muted/30' : ''} 
 								   {isInProgress ? 'in-progress-shine relative overflow-hidden' : ''}
-								   {task.completed ? 'opacity-60' : ''}"
+								   {(task.status === TaskStatus.COMPLETED || (task.status === TaskStatus.DECOMPOSED && areAllChildrenComplete)) ? 'opacity-60' : ''}"
 						>
 							{#if isNextPending}
 								<div class="flex items-center justify-center h-6 w-6 mt-1">
 									<Loader2 class="h-4 w-4 animate-spin text-primary" />
+								</div>
+							{:else if task.status === TaskStatus.DECOMPOSED}
+								<div class="flex items-center justify-center h-6 w-6 mt-1 text-muted-foreground">
+									<CornerDownRight class="h-4 w-4" />
 								</div>
 							{:else}
 								<Checkbox 
@@ -563,7 +611,7 @@
 									<label 
 										for={`task-${task.id}`} 
 										id={`task-label-${task.id}`}
-										class={`font-medium cursor-pointer ${task.completed ? 'line-through text-muted-foreground' : ''}`}
+										class={`font-medium cursor-pointer ${(task.status === TaskStatus.COMPLETED || (task.status === TaskStatus.DECOMPOSED && areAllChildrenComplete)) ? 'line-through text-muted-foreground' : ''}`}
 									>
 										{task.title}
 									</label>
@@ -586,17 +634,17 @@
 							</div>
 						</div>
 						{#if task.children && task.children.length > 0}
-							<div class="ml-8 pl-4 border-l border-border">
+							<div class="ml-10 pl-4 py-2 border-l border-border divide-y divide-border">
 								{#each task.children as childTask (childTask.id)}
 									{@const childTaskIndexInFlatList = $tasks.findIndex(t => t.id === childTask.id)}
 									{@const isChildNextPending = childTaskIndexInFlatList === firstPendingTaskIndex}
 									{@const isChildInProgress = childTask.status === TaskStatus.IN_PROGRESS}
 									<div 
 										transition:fade={{ duration: 200 }}
-										class="task-row flex items-start space-x-4 py-3 
+										class="task-row flex items-start space-x-4 pt-3 pr-4 mb-3 
 											   {isChildNextPending ? 'bg-muted/30' : ''} 
 											   {isChildInProgress ? 'in-progress-shine relative overflow-hidden' : ''}
-											   {childTask.completed ? 'opacity-60' : ''}"
+											   {childTask.status === TaskStatus.COMPLETED ? 'opacity-60' : ''}"
 									>
 										{#if isChildNextPending}
 											<div class="flex items-center justify-center h-6 w-6 mt-1">
@@ -617,7 +665,7 @@
 												<label 
 													for={`task-${childTask.id}`} 
 													id={`task-label-${childTask.id}`}
-													class={`font-medium cursor-pointer ${childTask.completed ? 'line-through text-muted-foreground' : ''}`}
+													class={`font-medium cursor-pointer ${childTask.status === TaskStatus.COMPLETED ? 'line-through text-muted-foreground' : ''}`}
 												>
 													{childTask.title}
 												</label>
@@ -652,7 +700,7 @@
 			<CardFooter class="flex flex-col items-start gap-4 px-6 py-4 border-t border-border">
 				<div class="w-full flex justify-between items-center">
 					<span class="text-sm text-muted-foreground">
-						{completedCount} of {totalTasks} tasks completed
+						{completedCount} of {totalActionableTasks} actionable tasks completed
 					</span>
 					<Button variant="outline" size="sm" on:click={refreshTasks} disabled={$loading}>
 						{#if $loading}
