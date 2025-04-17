@@ -7,6 +7,8 @@ import { logToFile } from './lib/logger'
 import { handleMarkTaskComplete } from './tools/markTaskComplete'
 import { handlePlanFeature } from './tools/planFeature'
 import { handleReviewChanges } from './tools/reviewChanges'
+import { AdjustPlanInputSchema, AdjustPlanInput } from './models/types'
+import { adjustPlanHandler } from './tools/adjustPlan'
 import webSocketService from './services/webSocketService'
 // Re-add static imports
 import express, { Request, Response } from 'express'
@@ -95,6 +97,27 @@ server.tool('review_changes', {}, async (_args, _extra) => {
     isError: result.isError,
   }
 })
+
+// 4. Tool: adjust_plan
+server.tool(
+  'adjust_plan',
+  {
+    featureId: z
+      .string()
+      .uuid({ message: 'Valid feature ID (UUID) is required.' }),
+    adjustment_request: z
+      .string()
+      .min(1, { message: 'Adjustment request cannot be empty.' }),
+  },
+  async (args: AdjustPlanInput, _extra) => {
+    const result = await adjustPlanHandler(args)
+
+    return {
+      content: [{ type: 'text', text: result.message }],
+      isError: result.status === 'error',
+    }
+  }
+)
 
 console.error('[TaskServer] LOG: Tools defined.')
 

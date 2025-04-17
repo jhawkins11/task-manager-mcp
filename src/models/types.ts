@@ -222,3 +222,16 @@ export const PlanFeatureResponseSchema = z.object({
 })
 
 export type PlanFeatureResponse = z.infer<typeof PlanFeatureResponseSchema>
+
+// Schema for adjust_plan tool input
+export const AdjustPlanInputSchema = z.object({
+  featureId: z
+    .string()
+    .uuid()
+    .describe('The ID of the feature whose plan needs adjustment.'),
+  adjustment_request: z
+    .string()
+    .describe('User request detailing the desired changes to the task list.'),
+})
+
+export type AdjustPlanInput = z.infer<typeof AdjustPlanInputSchema>

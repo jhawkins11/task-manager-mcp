@@ -10,10 +10,10 @@ import { promisify } from 'util'
 import { aiService } from '../services/aiService'
 import {
   parseGeminiPlanResponse,
-  determineTaskEffort,
-  breakDownHighEffortTask,
   extractParentTaskId,
   extractEffort,
+  ensureEffortRatings,
+  processAndBreakdownTasks,
 } from '../lib/llmUtils'
 import { logToFile } from '../lib/logger'
 import { readTasks, writeTasks, addHistoryEntry } from '../lib/fsUtils'
@@ -260,7 +260,6 @@ export async function handlePlanFeature(
 
     // --- LLM Planning & Task Generation ---
     let planSteps: string[] = []
-    let complexTaskMap = new Map<string, string>() // Map original high-effort task description to its generated parent ID
 
     try {
       await logToFile('[TaskServer] Calling LLM API for planning...')
@@ -452,118 +451,32 @@ export async function handlePlanFeature(
         return { content: [{ type: 'text', text: message }], isError }
       }
 
-      // --- Process LLM Response (Effort, Breakdown, Sequencing) ---
-
-      // 1. Add/Verify Effort Ratings
-      const effortRatedSteps: string[] = []
-      for (const taskDesc of planSteps) {
-        if (taskDesc.match(/^\[(low|medium|high)\]/i)) {
-          effortRatedSteps.push(taskDesc)
-        } else {
-          try {
-            const effort = await determineTaskEffort(taskDesc, planningModel)
-            effortRatedSteps.push(`[${effort}] ${taskDesc}`)
-          } catch (error) {
-            effortRatedSteps.push(`[medium] ${taskDesc}`) // Default on error
-            console.error(
-              `[TaskServer] Error determining effort for task "${taskDesc.substring(
-                0,
-                40
-              )}...":`,
-              error
-            )
-          }
-        }
-      }
+      // --- Process LLM Response (Effort, Breakdown, Task Creation using Utils) ---
       await logToFile(
-        `[TaskServer] Processed effort ratings for ${effortRatedSteps.length} steps.`
+        `[TaskServer] Processing ${planSteps.length} raw steps from LLM for effort and breakdown...`
       )
 
-      // 2. Identify High Effort Tasks for Breakdown
-      const tasksToKeepOrBreakdown: string[] = [...effortRatedSteps]
-      const finalProcessedSteps: string[] = [] // Will hold final list including subtasks in order
-      let breakdownSuccesses = 0
-      let breakdownFailures = 0
-
-      for (const step of tasksToKeepOrBreakdown) {
-        const effortMatch = step.match(/^\[(low|medium|high)\]/i)
-        const isHighEffort =
-          effortMatch && effortMatch[1].toLowerCase() === 'high'
-
-        if (isHighEffort) {
-          const taskDescription = step.replace(/^\[high\]\s*/i, '')
-          const parentId = crypto.randomUUID()
-          complexTaskMap.set(taskDescription, parentId) // Map description to ID
-
-          await addHistoryEntry(featureId, 'model', {
-            step: 'task_breakdown_attempt',
-            task: step,
-            parentId,
-          })
-
-          const subtasks = await breakDownHighEffortTask(
-            taskDescription,
-            parentId,
-            planningModel,
-            { minSubtasks: 2, maxSubtasks: 5, preferredEffort: 'medium' }
-          )
-
-          if (subtasks.length > 0) {
-            // Add parent container task (marked completed later)
-            finalProcessedSteps.push(`${step} [parentContainer]`) // Add marker
-
-            // Process and add subtasks immediately after parent
-            const subtasksWithParentIdAndEffort = await Promise.all(
-              subtasks.map(async (subtaskDesc) => {
-                const {
-                  description: cleanSubDescNoEffort,
-                  effort: subEffortInitial,
-                } = extractEffort(subtaskDesc)
-                // Ensure effort is valid or determine/default it
-                let finalEffort = subEffortInitial
-                if (!['low', 'medium', 'high'].includes(finalEffort)) {
-                  try {
-                    finalEffort = await determineTaskEffort(
-                      cleanSubDescNoEffort,
-                      planningModel
-                    )
-                  } catch {
-                    finalEffort = 'medium' // Default on error
-                  }
-                }
-                return `[${finalEffort}] ${cleanSubDescNoEffort} [parentTask:${parentId}]`
-              })
-            )
-            finalProcessedSteps.push(...subtasksWithParentIdAndEffort)
-
-            await addHistoryEntry(featureId, 'model', {
-              step: 'task_breakdown_success',
-              task: step,
-              parentId,
-              subtasks: subtasksWithParentIdAndEffort,
-            })
-            breakdownSuccesses++
-          } else {
-            // Breakdown failed, keep original high-effort task
-            finalProcessedSteps.push(step)
-            await addHistoryEntry(featureId, 'model', {
-              step: 'task_breakdown_failure',
-              task: step,
-            })
-            breakdownFailures++
-          }
-        } else {
-          // Keep low/medium effort tasks as is
-          finalProcessedSteps.push(step)
-        }
-      }
-
-      planSteps = finalProcessedSteps // Update planSteps with the final ordered list
+      // 1. Ensure Effort Ratings using utility function
+      const effortRatedSteps = await ensureEffortRatings(
+        planSteps,
+        planningModel
+      )
       await logToFile(
-        `[TaskServer] Final plan processing: ${planSteps.length} total steps in sequence (${breakdownSuccesses} successful breakdowns, ${breakdownFailures} failures).`
+        `[TaskServer] Ensured effort ratings for ${effortRatedSteps.length} steps.`
       )
 
-      if (planSteps.length === 0) {
+      // 2. Breakdown High Effort Tasks and Create Task Objects using utility function
+      const { finalTasks, complexTaskMap } = await processAndBreakdownTasks(
+        effortRatedSteps,
+        planningModel,
+        featureId
+      )
+      await logToFile(
+        `[TaskServer] Completed breakdown and task object creation. Result: ${finalTasks.length} Task objects.`
+      )
+
+      // --- Validation after processing ---
+      if (finalTasks.length === 0) {
         await logToFile(
           '[TaskServer] Planning resulted in zero tasks after processing.'
         )
@@ -579,42 +492,16 @@ export async function handlePlanFeature(
         return { content: [{ type: 'text', text: message }] }
       }
 
-      // --- Create Task Objects and Save ---
-      const newTasks: Task[] = planSteps.map((step) => {
-        const isParentContainer = step.includes('[parentContainer]')
-        const descriptionWithTags = step.replace('[parentContainer]', '').trim()
-
-        const { description: descWithoutParent, parentTaskId } =
-          extractParentTaskId(descriptionWithTags)
-        const { description: cleanDescription, effort } =
-          extractEffort(descWithoutParent)
-
-        // Get the predetermined ID for parent containers, otherwise generate new
-        const taskId =
-          complexTaskMap.get(cleanDescription) || crypto.randomUUID()
-
-        const status = isParentContainer ? 'completed' : 'pending'
-
-        return {
-          id: taskId,
-          status,
-          description: cleanDescription,
-          effort,
-          completed: status === 'completed', // Add completed flag based on status
-          ...(parentTaskId && { parentTaskId }),
-        }
-      })
-
-      task_count = newTasks.filter((task) => task.status === 'pending').length // Count only actionable (pending) tasks
-
-      await writeTasks(featureId, newTasks)
+      // --- Save Tasks ---
+      task_count = finalTasks.filter((task) => task.status === 'pending').length // Count only actionable (pending) tasks
+      await writeTasks(featureId, finalTasks) // Use finalTasks directly
       await logToFile(
-        `[TaskServer] New plan saved for feature ${featureId} with ${newTasks.length} total items (${task_count} pending tasks).`
+        `[TaskServer] New plan saved for feature ${featureId} with ${finalTasks.length} total items (${task_count} pending tasks).`
       )
 
-      // Broadcast the tasks update via WebSocket
+      // --- Broadcast and Launch UI ---
       try {
-        webSocketService.notifyTasksUpdated(featureId, newTasks)
+        webSocketService.notifyTasksUpdated(featureId, finalTasks) // Use finalTasks
         await logToFile(
           `[TaskServer] Broadcast tasks_updated event for feature ${featureId}`
         )
@@ -647,11 +534,9 @@ export async function handlePlanFeature(
         )
       }
 
-      // Success message includes the feature ID and task count
+      // --- Format Success Response ---
       message = `Successfully generated plan for feature ID ${featureId} with ${task_count} pending tasks: "${feature_description}"`
-
-      // Find the first pending task to include in the response
-      const firstTask = newTasks.find((task) => task.status === 'pending')
+      const firstTask = finalTasks.find((task) => task.status === 'pending')
 
       if (firstTask) {
         // Include effort in the message if available
@@ -663,7 +548,7 @@ export async function handlePlanFeature(
         let parentInfo = ''
         if (firstTask.parentTaskId) {
           // Find the parent task
-          const parentTask = newTasks.find(
+          const parentTask = finalTasks.find(
             (t) => t.id === firstTask.parentTaskId
           )
           if (parentTask) {
@@ -692,7 +577,6 @@ export async function handlePlanFeature(
         firstTask: firstTask || undefined,
       })
 
-      // Return success structure with featureId in the message
       return {
         content: [{ type: 'text', text: message }],
       }

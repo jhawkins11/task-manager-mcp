@@ -1,15 +1,23 @@
 import { GenerateContentResult, GenerativeModel } from '@google/generative-ai'
 import OpenAI from 'openai'
+import crypto from 'crypto'
 import {
   BreakdownOptions,
   EffortEstimationSchema,
   TaskBreakdownSchema,
   TaskBreakdownResponseSchema,
+  Task,
+  TaskListSchema,
+  HistoryEntry,
+  FeatureHistorySchema,
+  TaskSchema,
 } from '../models/types'
 import { aiService } from '../services/aiService'
 import { logToFile } from './logger'
 import { safetySettings, OPENROUTER_MODEL, GEMINI_MODEL } from '../config'
 import { z } from 'zod'
+import { encoding_for_model } from 'tiktoken'
+import { addHistoryEntry } from './fsUtils'
 
 /**
  * Parses the text response from Gemini into a list of tasks.
@@ -336,4 +344,231 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
       rawData: parsedData,
     }
   }
+}
+
+/**
+ * Ensures all task descriptions have an effort rating prefix.
+ * Determines effort using an LLM if missing.
+ */
+export async function ensureEffortRatings(
+  taskDescriptions: string[],
+  model: GenerativeModel | OpenAI | null
+): Promise<string[]> {
+  const effortRatedTasks: string[] = []
+  for (const taskDesc of taskDescriptions) {
+    const effortMatch = taskDesc.match(/^\[(low|medium|high)\]/i)
+    if (effortMatch) {
+      // Ensure consistent casing
+      const effort = effortMatch[1].toLowerCase() as 'low' | 'medium' | 'high'
+      const cleanDesc = taskDesc.replace(/^\[(low|medium|high)\]\s*/i, '')
+      effortRatedTasks.push(`[${effort}] ${cleanDesc}`)
+    } else {
+      let effort: 'low' | 'medium' | 'high' = 'medium' // Default effort
+      try {
+        if (model) {
+          // Only call if model is available
+          effort = await determineTaskEffort(taskDesc, model)
+        }
+      } catch (error) {
+        console.error(
+          `[TaskServer] Error determining effort for task "${taskDesc.substring(
+            0,
+            40
+          )}...". Defaulting to medium:`,
+          error
+        )
+      }
+      effortRatedTasks.push(`[${effort}] ${taskDesc}`)
+    }
+  }
+  return effortRatedTasks
+}
+
+/**
+ * Processes tasks: breaks down high-effort ones, ensures effort, and creates Task objects.
+ */
+export async function processAndBreakdownTasks(
+  initialTasksWithEffort: string[],
+  model: GenerativeModel | OpenAI | null,
+  featureId: string
+): Promise<{ finalTasks: Task[]; complexTaskMap: Map<string, string> }> {
+  const finalProcessedSteps: string[] = []
+  const complexTaskMap = new Map<string, string>()
+  let breakdownSuccesses = 0
+  let breakdownFailures = 0
+
+  for (const step of initialTasksWithEffort) {
+    const effortMatch = step.match(/^\[(low|medium|high)\]/i)
+    const isHighEffort = effortMatch && effortMatch[1].toLowerCase() === 'high'
+
+    if (isHighEffort) {
+      const taskDescription = step.replace(/^\[high\]\s*/i, '')
+      const parentId = crypto.randomUUID()
+      complexTaskMap.set(taskDescription, parentId) // Map original description to ID
+
+      try {
+        await addHistoryEntry(featureId, 'model', {
+          step: 'task_breakdown_attempt',
+          task: step,
+          parentId,
+        })
+
+        const subtasks = await breakDownHighEffortTask(
+          taskDescription,
+          parentId,
+          model,
+          { minSubtasks: 2, maxSubtasks: 5, preferredEffort: 'medium' }
+        )
+
+        if (subtasks.length > 0) {
+          // Add parent container task (marked completed later)
+          finalProcessedSteps.push(`${step} [parentContainer]`) // Add marker
+
+          // Process and add subtasks immediately after parent
+          // Ensure subtasks also have effort ratings
+          const subtasksWithEffort = await ensureEffortRatings(subtasks, model)
+          const subtasksWithParentId = subtasksWithEffort.map((subtaskDesc) => {
+            const { description: cleanSubDesc } = extractEffort(subtaskDesc) // Already has effort
+            return `${subtaskDesc} [parentTask:${parentId}]`
+          })
+
+          finalProcessedSteps.push(...subtasksWithParentId)
+
+          await addHistoryEntry(featureId, 'model', {
+            step: 'task_breakdown_success',
+            task: step,
+            parentId,
+            subtasks: subtasksWithParentId,
+          })
+          breakdownSuccesses++
+        } else {
+          // Breakdown failed, keep original high-effort task
+          finalProcessedSteps.push(step)
+          await addHistoryEntry(featureId, 'model', {
+            step: 'task_breakdown_failure',
+            task: step,
+          })
+          breakdownFailures++
+        }
+      } catch (breakdownError) {
+        console.error(
+          `[TaskServer] Error during breakdown for task "${taskDescription.substring(
+            0,
+            40
+          )}...":`,
+          breakdownError
+        )
+        finalProcessedSteps.push(step) // Keep original task on error
+        await addHistoryEntry(featureId, 'model', {
+          step: 'task_breakdown_error',
+          task: step,
+          error:
+            breakdownError instanceof Error
+              ? breakdownError.message
+              : String(breakdownError),
+        })
+        breakdownFailures++
+      }
+    } else {
+      // Keep low/medium effort tasks as is
+      finalProcessedSteps.push(step)
+    }
+  }
+
+  await logToFile(
+    `[TaskServer] Breakdown processing complete: ${breakdownSuccesses} successes, ${breakdownFailures} failures.`
+  )
+
+  // --- Create Task Objects ---
+  const finalTasks: Task[] = []
+  const taskCreationErrors: string[] = []
+
+  for (const step of finalProcessedSteps) {
+    try {
+      const isParentContainer = step.includes('[parentContainer]')
+      const descriptionWithTags = step.replace('[parentContainer]', '').trim()
+
+      const { description: descWithoutParent, parentTaskId } =
+        extractParentTaskId(descriptionWithTags)
+      const { description: cleanDescription, effort } =
+        extractEffort(descWithoutParent)
+
+      // Validate effort extracted or default
+      const validatedEffort = ['low', 'medium', 'high'].includes(effort)
+        ? effort
+        : 'medium'
+
+      // Get the predetermined ID for parent containers, otherwise generate new
+      // Note: The complexTaskMap uses the *original* high-effort description before breakdown
+      const originalHighEffortDesc = isParentContainer
+        ? cleanDescription // The cleanDescription of a parent container *is* the original high-effort desc
+        : null
+
+      const taskId =
+        (originalHighEffortDesc &&
+          complexTaskMap.get(originalHighEffortDesc)) ||
+        crypto.randomUUID()
+
+      const status = isParentContainer ? 'completed' : 'pending'
+
+      const taskData = {
+        id: taskId,
+        feature_id: featureId,
+        status,
+        description: cleanDescription,
+        effort: validatedEffort,
+        completed: status === 'completed',
+        ...(parentTaskId && { parentTaskId }),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }
+
+      // Validate against the Task schema before pushing
+      const validationResult = TaskSchema.safeParse(taskData)
+      if (validationResult.success) {
+        finalTasks.push(validationResult.data)
+      } else {
+        taskCreationErrors.push(
+          `Task "${cleanDescription.substring(0, 30)}..." failed validation: ${
+            validationResult.error.message
+          }`
+        )
+        console.warn(
+          `[TaskServer] Task validation failed for "${cleanDescription.substring(
+            0,
+            30
+          )}...":`,
+          validationResult.error.flatten()
+        )
+      }
+    } catch (creationError) {
+      taskCreationErrors.push(
+        `Error creating task object for step "${step.substring(0, 30)}...": ${
+          creationError instanceof Error
+            ? creationError.message
+            : String(creationError)
+        }`
+      )
+      console.error(
+        `[TaskServer] Error creating task object for step "${step.substring(
+          0,
+          30
+        )}...":`,
+        creationError
+      )
+    }
+  }
+
+  if (taskCreationErrors.length > 0) {
+    console.error(
+      `[TaskServer] ${taskCreationErrors.length} errors occurred during task object creation/validation.`
+    )
+    await addHistoryEntry(featureId, 'model', {
+      step: 'task_creation_errors',
+      errors: taskCreationErrors,
+    })
+    // Decide if we should throw or return partial results. Returning for now.
+  }
+
+  return { finalTasks, complexTaskMap }
 }
