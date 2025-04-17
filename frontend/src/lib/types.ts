@@ -12,6 +12,7 @@ export interface Task {
   parentTaskId?: string
   createdAt?: string
   updatedAt?: string
+  children?: Task[]
 }
 
 /**

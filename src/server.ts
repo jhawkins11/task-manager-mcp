@@ -303,13 +303,6 @@ async function main() {
     const httpServer = app.listen(PORT, () => {
       const url = `http://localhost:${PORT}`
       console.error(`[TaskServer] LOG: Frontend server running at ${url}`)
-
-      // Automatically open browser when started - REMOVED
-      /* try {
-        open(url)
-      } catch (err) {
-        console.error('[TaskServer] WARN: Failed to open browser:', err)
-      } */
     })
 
     // Initialize WebSocket service with the HTTP server instance

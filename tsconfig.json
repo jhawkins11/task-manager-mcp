@@ -10,7 +10,8 @@
     "forceConsistentCasingInFileNames": true, // Ensure consistent file casing
     "moduleResolution": "node", // Use Node.js module resolution
     "resolveJsonModule": true, // Allow importing JSON files
-    "sourceMap": true // Generate source maps for debugging
+    "sourceMap": true, // Generate source maps for debugging
+    "incremental": true // Enable incremental compilation
   },
   "include": ["src/**/*"], // Include all files in the src directory
   "exclude": ["node_modules", "**/*.spec.ts"] // Exclude node_modules and test files
