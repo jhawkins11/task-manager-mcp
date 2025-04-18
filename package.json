@@ -24,6 +24,8 @@
     "openai": "^4.94.0",
     "svelte": "^5.27.1",
     "tiktoken": "^1.0.20",
+    "winston": "^3.17.0",
+    "winston-daily-rotate-file": "^5.0.0",
     "ws": "^8.16.0",
     "zod": "^3.24.2"
   },

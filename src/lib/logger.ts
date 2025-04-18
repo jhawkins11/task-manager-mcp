@@ -1,9 +1,4 @@
-import path from 'path'
-import fs from 'fs/promises'
-
-// --- User's Logging Setup ---
-const logDir = path.join(__dirname, '../../logs')
-const logFile = path.join(logDir, 'debug.log')
+import logger from './winstonLogger'
 
 /**
  * Logs a message to the debug log file
@@ -11,12 +6,10 @@ const logFile = path.join(logDir, 'debug.log')
  */
 export async function logToFile(message: string): Promise<void> {
   try {
-    // Ensure log directory exists every time
-    await fs.mkdir(logDir, { recursive: true })
-    await fs.appendFile(logFile, `${new Date().toISOString()} - ${message}\n`)
+    logger.debug(message)
   } catch (error) {
-    // Fallback to console if file logging fails
-    console.error(`[TaskServer] Error writing to log file (${logFile}):`, error)
+    // Fallback to console if logger fails
+    console.error(`[TaskServer] Error using logger:`, error)
     console.error(`[TaskServer] Original log message: ${message}`)
   }
 }

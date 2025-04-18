@@ -4,6 +4,7 @@ import { z } from 'zod'
 import * as fsSync from 'fs'
 import * as fs from 'fs/promises'
 import { logToFile } from './lib/logger'
+import logger from './lib/winstonLogger'
 import { handleMarkTaskComplete } from './tools/markTaskComplete'
 import { handlePlanFeature } from './tools/planFeature'
 import { handleReviewChanges } from './tools/reviewChanges'
@@ -12,7 +13,7 @@ import { adjustPlanHandler } from './tools/adjustPlan'
 import webSocketService from './services/webSocketService'
 import planningStateService from './services/planningStateService'
 // Re-add static imports
-import express, { Request, Response } from 'express'
+import express, { Request, Response, NextFunction } from 'express'
 import path from 'path'
 import crypto from 'crypto'
 
@@ -22,10 +23,10 @@ import { Task } from './models/types'
 import { detectClarificationRequest } from './lib/llmUtils'
 
 // Immediately log that we're starting up
-console.error('[TaskServer] LOG: Starting task manager server...')
+logger.info('Starting task manager server...')
 
 // --- MCP Server Setup ---
-console.error('[TaskServer] LOG: Setting up MCP Server instance...')
+logger.info('Setting up MCP Server instance...')
 const server = new McpServer({
   name: 'task-manager-mcp',
   version: '0.6.3',
@@ -35,10 +36,10 @@ const server = new McpServer({
     tools: { listChanged: false },
   },
 })
-console.error('[TaskServer] LOG: MCP Server instance created.')
+logger.info('MCP Server instance created.')
 
 // --- Tool Definitions ---
-console.error('[TaskServer] LOG: Defining tools...')
+logger.info('Defining tools...')
 
 // New 'get_next_task' tool
 server.tool(
@@ -112,7 +113,7 @@ server.tool(
       const errorMsg = `Error processing get_next_task request: ${
         error instanceof Error ? error.message : String(error)
       }`
-      console.error(`[TaskServer] ${errorMsg}`)
+      logger.error(errorMsg)
       await logToFile(`[TaskServer] ${errorMsg}`)
 
       return {
@@ -207,13 +208,13 @@ server.tool(
   }
 )
 
-console.error('[TaskServer] LOG: Tools defined.')
+logger.info('Tools defined.')
 
 // --- Error Handlers ---
 // Add top-level error handler for synchronous errors during load
 process.on('uncaughtException', (error) => {
   // Cannot reliably use async logToFile here
-  console.error('[TaskServer] FATAL: Uncaught Exception:', error)
+  logger.error('Uncaught Exception:', error)
   // Use synchronous append for critical errors before exit
   try {
     const logDir = process.env.LOG_DIR || './logs'
@@ -226,18 +227,13 @@ process.on('uncaughtException', (error) => {
       }\n${error?.stack || ''}\n`
     )
   } catch (logErr) {
-    console.error('Error writing uncaughtException to sync log:', logErr)
+    logger.error('Error writing uncaughtException to sync log:', logErr)
   }
   process.exit(1)
 })
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error(
-    '[TaskServer] FATAL: Unhandled Rejection at:',
-    promise,
-    'reason:',
-    reason
-  )
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason)
   try {
     const logDir = process.env.LOG_DIR || './logs'
     const logFile = process.env.LOG_FILE || `${logDir}/debug.log`
@@ -247,7 +243,7 @@ process.on('unhandledRejection', (reason, promise) => {
       `${new Date().toISOString()} - [TaskServer] FATAL: Unhandled Rejection: ${reason}\n`
     )
   } catch (logErr) {
-    console.error('Error writing unhandledRejection to sync log:', logErr)
+    logger.error('Error writing unhandledRejection to sync log:', logErr)
   }
   process.exit(1)
 })
@@ -271,7 +267,7 @@ async function listFeatures() {
 
     return featureIds
   } catch (error) {
-    console.error('[TaskServer] Error listing features:', error)
+    logger.error('Error listing features:', error)
     return []
   }
 }
@@ -293,11 +289,29 @@ function formatTaskForFrontend(task: Task, featureId: string) {
 // --- Server Start ---
 async function main() {
   await logToFile('[TaskServer] LOG: main() started.')
+  logger.info('Main function started')
 
   try {
     // --- Express Server Setup --- Moved inside main, after MCP connect
     const app = express()
     const PORT = process.env.PORT || UI_PORT || 4999
+
+    // HTTP request logging middleware
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      const start = new Date().getTime()
+
+      res.on('finish', () => {
+        const duration = new Date().getTime() - start
+        logger.info({
+          method: req.method,
+          url: req.url,
+          status: res.statusCode,
+          duration: `${duration}ms`,
+        })
+      })
+
+      next()
+    })
 
     // --- MCP Server Connection --- Moved after Express init
     await logToFile('[TaskServer] LOG: Creating transport...')
@@ -319,6 +333,7 @@ async function main() {
           const featureIds = await listFeatures()
           res.json(featureIds)
         } catch (error: any) {
+          logger.error(`Failed to fetch features: ${error?.message || error}`)
           await logToFile(
             `[TaskServer] ERROR fetching features: ${error?.message || error}`
           )
@@ -341,6 +356,11 @@ async function main() {
 
           res.json(formattedTasks)
         } catch (error: any) {
+          logger.error(
+            `Failed to fetch tasks for feature ${featureId}: ${
+              error?.message || error
+            }`
+          )
           await logToFile(
             `[TaskServer] ERROR fetching tasks for feature ${featureId}: ${
               error?.message || error
@@ -411,6 +431,7 @@ async function main() {
 
           res.status(201).json(formatTaskForFrontend(newTask, featureId))
         } catch (error: any) {
+          logger.error(`Failed to create task: ${error?.message || error}`)
           await logToFile(
             `[TaskServer] ERROR creating task: ${error?.message || error}`
           )
@@ -487,6 +508,7 @@ async function main() {
 
           res.json(formatTaskForFrontend(tasks[taskIndex], featureId))
         } catch (error: any) {
+          logger.error(`Failed to update task: ${error?.message || error}`)
           await logToFile(
             `[TaskServer] ERROR updating task: ${error?.message || error}`
           )
@@ -544,6 +566,7 @@ async function main() {
             task: formatTaskForFrontend(removedTask, featureId as string),
           })
         } catch (error: any) {
+          logger.error(`Failed to delete task: ${error?.message || error}`)
           await logToFile(
             `[TaskServer] ERROR deleting task: ${error?.message || error}`
           )
@@ -670,7 +693,7 @@ async function main() {
     // Start the Express server and capture the HTTP server instance
     const httpServer = app.listen(PORT, () => {
       const url = `http://localhost:${PORT}`
-      console.error(`[TaskServer] LOG: Frontend server running at ${url}`)
+      logger.info(`Frontend server running at ${url}`)
     })
 
     // Initialize WebSocket service with the HTTP server instance
@@ -683,10 +706,7 @@ async function main() {
       await logToFile(
         `[TaskServer] WARN: Failed to initialize WebSocket server: ${wsError}`
       )
-      console.error(
-        '[TaskServer] WARN: WebSocket server initialization failed:',
-        wsError
-      )
+      logger.error('WebSocket server initialization failed:', wsError)
       // Decide if this is fatal or can continue
     }
 
@@ -731,19 +751,14 @@ async function main() {
       process.exit(0)
     })
   } catch (connectError) {
-    console.error(
-      '[TaskServer] CRITICAL ERROR during server.connect():',
-      connectError
-    )
+    logger.error('CRITICAL ERROR during server.connect():', connectError)
     process.exit(1)
   }
 }
 
-console.error(
-  '[TaskServer] LOG: Script execution reaching end of top-level code.'
-)
+logger.info('Script execution reaching end of top-level code.')
 main().catch((error) => {
-  console.error('[TaskServer] CRITICAL ERROR executing main():', error)
+  logger.error('CRITICAL ERROR executing main():', error)
   try {
     const logDir = process.env.LOG_DIR || './logs'
     const logFile = process.env.LOG_FILE || `${logDir}/debug.log`
@@ -755,7 +770,7 @@ main().catch((error) => {
       }\n${error?.stack || ''}\n`
     )
   } catch (logErr) {
-    console.error('Error writing main() catch to sync log:', logErr)
+    logger.error('Error writing main() catch to sync log:', logErr)
   }
   process.exit(1) // Exit if main promise rejects
 })

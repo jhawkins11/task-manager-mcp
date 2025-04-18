@@ -100,12 +100,18 @@
 				switch (message.type) {
 					case 'tasks_updated':
 						console.log(`[WS Client] Received tasks_updated for feature ${featureId}:`, message.payload.tasks);
-						if (message.payload?.tasks) {
-							// Directly update tasks store instead of triggering a fetch
-							tasks.set(message.payload.tasks as Task[]);
+						if (message.payload?.tasks && Array.isArray(message.payload.tasks) && featureId) {
+							// Map incoming tasks using the helper function to ensure consistency
+							const mappedTasks = message.payload.tasks.map((task: any) => 
+								mapApiTaskToClientTask(task, featureId as string)
+							);
+							tasks.set(mappedTasks);
 							// Explicitly set loading to false
 							loading.set(false);
 							error.set(null); // Clear any previous errors
+						} else {
+							console.warn('[WS Client] Invalid or missing tasks payload for tasks_updated message.');
+							// Optionally handle this case, e.g., set an error or leave tasks unchanged
 						}
 						break;
 					case 'status_changed':
