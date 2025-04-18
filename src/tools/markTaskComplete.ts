@@ -283,9 +283,9 @@ async function getNextTaskAfterCompletion(
     const parentTask = tasks.find((t) => t.id === nextTask.parentTaskId)
     if (parentTask) {
       const parentDesc =
-        parentTask.description.length > 30
-          ? parentTask.description.substring(0, 30) + '...'
-          : parentTask.description
+        (parentTask?.description?.length ?? 0) > 30
+          ? (parentTask?.description?.substring(0, 30) ?? '') + '...'
+          : parentTask?.description ?? ''
       parentInfo = ` (Subtask of: "${parentDesc}")`
     } else {
       parentInfo = ` (Subtask of parent ID: ${nextTask.parentTaskId})` // Fallback if parent not found

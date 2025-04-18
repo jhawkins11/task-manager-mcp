@@ -8,12 +8,13 @@
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Select from '$lib/components/ui/select';
 	import { Progress } from '$lib/components/ui/progress';
-	import { Loader2, CornerDownLeft, CornerDownRight } from 'lucide-svelte';
+	import { Loader2, CornerDownLeft, CornerDownRight, Pencil, Trash2 } from 'lucide-svelte';
 	import { writable, type Writable } from 'svelte/store';
 	import type { Task, WebSocketMessage, ShowQuestionPayload, QuestionResponsePayload } from '$lib/types';
 	import { TaskStatus, TaskEffort } from '$lib/types';
 	import type { Selected } from 'bits-ui';
 	import QuestionModal from '$lib/components/QuestionModal.svelte';
+	import TaskFormModal from '$lib/components/TaskFormModal.svelte';
 
 	// Convert to writable stores for better state management
 	const tasks: Writable<Task[]> = writable([]);
@@ -29,6 +30,11 @@
 	// Question modal state
 	let showQuestionModal = false;
 	let questionData: ShowQuestionPayload | null = null;
+
+	// Task form modal state
+	let showTaskFormModal = false;
+	let editingTask: Task | null = null;
+	let isEditing = false;
 
 	// Reactive statement to update nestedTasks when tasks store changes
 	$: {
@@ -143,6 +149,43 @@
 						error.set(message.payload?.message || 'Received error from server.');
 						// Error likely means loading is done (with an error)
 						loading.set(false);
+						break;
+					case 'task_created':
+						console.log('[WS Client] Received task_created:', message.payload);
+						if (message.payload?.task) {
+							// Map incoming task to our Task type
+							const newTask = mapApiTaskToClientTask(message.payload.task, message.featureId || featureId || '');
+							// Add the new task to the store
+							tasks.update(currentTasks => [...currentTasks, newTask]);
+							// Process nested structure
+							processNestedTasks();
+						}
+						break;
+					case 'task_updated':
+						console.log('[WS Client] Received task_updated:', message.payload);
+						if (message.payload?.task) {
+							// Map incoming task to our Task type
+							const updatedTask = mapApiTaskToClientTask(message.payload.task, message.featureId || featureId || '');
+							// Update the existing task in the store
+							tasks.update(currentTasks =>
+								currentTasks.map(task =>
+									task.id === updatedTask.id ? updatedTask : task
+								)
+							);
+							// Process nested structure
+							processNestedTasks();
+						}
+						break;
+					case 'task_deleted':
+						console.log('[WS Client] Received task_deleted:', message.payload);
+						if (message.payload?.taskId) {
+							// Remove the task from the store
+							tasks.update(currentTasks =>
+								currentTasks.filter(task => task.id !== message.payload.taskId)
+							);
+							// Process nested structure
+							processNestedTasks();
+						}
 						break;
 					case 'connection_established':
 						console.log('[WS Client] Server confirmed connection.');
@@ -303,6 +346,143 @@
 		}
 	}
 
+	function processNestedTasks() {
+		// Define the type for map values explicitly
+		type TaskWithChildren = Task & { children: Task[] };
+
+		const taskMap = new Map<string, TaskWithChildren>(
+			$tasks.map(task => [task.id, { ...task, children: [] }])
+		);
+		const rootTasks: Task[] = [];
+
+		taskMap.forEach((task: TaskWithChildren) => { 
+			if (task.parentTaskId && taskMap.has(task.parentTaskId)) {
+				const parent = taskMap.get(task.parentTaskId);
+				if (parent) {
+					parent.children.push(task);
+				} else {
+					rootTasks.push(task);
+				}
+			} else {
+				rootTasks.push(task);
+			}
+		});
+
+		// Optional: Sort root tasks or children if needed
+		// rootTasks.sort(...); 
+		// taskMap.forEach(task => task.children.sort(...));
+
+		nestedTasks = rootTasks;
+	}
+
+	async function addTask(taskData: { title: string; effort: string; featureId: string }) {
+		try {
+			const response = await fetch('/api/tasks', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json'
+				},
+				body: JSON.stringify({
+					...taskData,
+					description: taskData.title // Use title as description
+				})
+			});
+
+			if (!response.ok) {
+				throw new Error(`Failed to create task: ${response.statusText}`);
+			}
+
+			const newTask = await response.json();
+			console.log('[Task] New task created:', newTask);
+
+			// Refresh the tasks list
+			await fetchTasks(taskData.featureId);
+			
+			// Clear any errors that might have been shown
+			error.set(null);
+		} catch (err) {
+			console.error('[Task] Error creating task:', err);
+			error.set(err instanceof Error ? err.message : 'Failed to create task');
+		}
+	}
+
+	function handleTaskFormSubmit(event: CustomEvent) {
+		const taskData = event.detail;
+		if (isEditing && editingTask) {
+			updateTask(editingTask.id, taskData);
+		} else {
+			addTask(taskData);
+		}
+		showTaskFormModal = false;
+		isEditing = false;
+		editingTask = null;
+	}
+
+	function openEditTaskModal(task: Task) {
+		editingTask = task;
+		isEditing = true;
+		showTaskFormModal = true;
+	}
+
+	async function updateTask(taskId: string, taskData: { title: string; effort: string; featureId: string }) {
+		try {
+			const response = await fetch(`/api/tasks/${taskId}`, {
+				method: 'PUT',
+				headers: {
+					'Content-Type': 'application/json'
+				},
+				body: JSON.stringify({
+					...taskData,
+					description: taskData.title, // Use title as description
+					featureId: taskData.featureId
+				})
+			});
+
+			if (!response.ok) {
+				throw new Error(`Failed to update task: ${response.statusText}`);
+			}
+
+			const updatedTask = await response.json();
+			console.log('[Task] Task updated:', updatedTask);
+
+			// Refresh the tasks list
+			await fetchTasks(taskData.featureId);
+			
+			// Clear any errors that might have been shown
+			error.set(null);
+		} catch (err) {
+			console.error('[Task] Error updating task:', err);
+			error.set(err instanceof Error ? err.message : 'Failed to update task');
+		}
+	}
+
+	async function deleteTask(taskId: string, featureId: string) {
+		if (!confirm('Are you sure you want to delete this task?')) {
+			return;
+		}
+		
+		try {
+			const response = await fetch(`/api/tasks/${taskId}?featureId=${featureId}`, {
+				method: 'DELETE'
+			});
+
+			if (!response.ok) {
+				throw new Error(`Failed to delete task: ${response.statusText}`);
+			}
+
+			console.log('[Task] Task deleted:', taskId);
+
+			// Refresh the tasks list
+			await fetchTasks(featureId);
+			
+			// Clear any errors that might have been shown
+			error.set(null);
+		} catch (err) {
+			console.error('[Task] Error deleting task:', err);
+			error.set(err instanceof Error ? err.message : 'Failed to delete task');
+		}
+	}
+
 	onMount(async () => {
 		loading.set(true); // Set loading true at the start
 		error.set(null); // Reset error
@@ -413,35 +593,6 @@
 		}
 	}
 
-	function processNestedTasks() {
-		// Define the type for map values explicitly
-		type TaskWithChildren = Task & { children: Task[] };
-
-		const taskMap = new Map<string, TaskWithChildren>(
-			$tasks.map(task => [task.id, { ...task, children: [] }])
-		);
-		const rootTasks: Task[] = [];
-
-		taskMap.forEach((task: TaskWithChildren) => { 
-			if (task.parentTaskId && taskMap.has(task.parentTaskId)) {
-				const parent = taskMap.get(task.parentTaskId);
-				if (parent) {
-					parent.children.push(task);
-				} else {
-					rootTasks.push(task);
-				}
-			} else {
-				rootTasks.push(task);
-			}
-		});
-
-		// Optional: Sort root tasks or children if needed
-		// rootTasks.sort(...); 
-		// taskMap.forEach(task => task.children.sort(...));
-
-		nestedTasks = rootTasks;
-	}
-
 	function refreshTasks() {
 		if ($loading) return;
 		console.log('[Task List] Refreshing tasks...');
@@ -516,6 +667,46 @@
 		if ($tasks) {
 			processNestedTasks();
 		}
+	}
+
+	// Helper function to map API task response to client Task type
+	function mapApiTaskToClientTask(apiTask: any, currentFeatureId: string): Task {
+		// Map incoming status string to TaskStatus enum
+		let status: TaskStatus;
+		switch (apiTask.status) {
+			case 'completed': status = TaskStatus.COMPLETED; break;
+			case 'in_progress': status = TaskStatus.IN_PROGRESS; break;
+			case 'decomposed': status = TaskStatus.DECOMPOSED; break;
+			default: status = TaskStatus.PENDING; break;
+		}
+		
+		// Ensure effort is one of our enum values
+		let effort: TaskEffort = TaskEffort.MEDIUM; // Default
+		if (apiTask.effort === 'low') {
+			effort = TaskEffort.LOW;
+		} else if (apiTask.effort === 'high') {
+			effort = TaskEffort.HIGH;
+		}
+		
+		// Derive title from description if not present
+		const title = apiTask.title || apiTask.description;
+		
+		// Ensure completed flag is consistent with status
+		const completed = status === TaskStatus.COMPLETED;
+		
+		// Return the fully mapped task
+		return {
+			id: apiTask.id,
+			title,
+			description: apiTask.description,
+			status,
+			completed,
+			effort,
+			feature_id: apiTask.feature_id || currentFeatureId,
+			parentTaskId: apiTask.parentTaskId,
+			createdAt: apiTask.createdAt,
+			updatedAt: apiTask.updatedAt
+		} as Task;
 	}
 
 </script>
@@ -632,6 +823,22 @@
 									</Badge>
 								{/if}
 							</div>
+							<div class="flex gap-1 ml-4">
+								<button
+									class="text-muted-foreground hover:text-foreground p-1 rounded-sm hover:bg-muted transition-colors"
+									title="Edit task"
+									on:click|stopPropagation={() => openEditTaskModal(task)}
+								>
+									<Pencil size={16} />
+								</button>
+								<button
+									class="text-muted-foreground hover:text-destructive p-1 rounded-sm hover:bg-muted transition-colors"
+									title="Delete task"
+									on:click|stopPropagation={() => deleteTask(task.id, featureId || '')}
+								>
+									<Trash2 size={16} />
+								</button>
+							</div>
 						</div>
 						{#if task.children && task.children.length > 0}
 							<div class="ml-10 pl-4 py-2 border-l border-border divide-y divide-border">
@@ -686,6 +893,22 @@
 												</Badge>
 											{/if}
 										</div>
+										<div class="flex gap-1 ml-4">
+											<button
+												class="text-muted-foreground hover:text-foreground p-1 rounded-sm hover:bg-muted transition-colors"
+												title="Edit subtask"
+												on:click|stopPropagation={() => openEditTaskModal(childTask)}
+											>
+												<Pencil size={16} />
+											</button>
+											<button
+												class="text-muted-foreground hover:text-destructive p-1 rounded-sm hover:bg-muted transition-colors"
+												title="Delete subtask"
+												on:click|stopPropagation={() => deleteTask(childTask.id, featureId || '')}
+											>
+												<Trash2 size={16} />
+											</button>
+										</div>
 									</div>
 								{/each}
 							</div>
@@ -702,12 +925,17 @@
 					<span class="text-sm text-muted-foreground">
 						{completedCount} of {totalActionableTasks} actionable tasks completed
 					</span>
-					<Button variant="outline" size="sm" on:click={refreshTasks} disabled={$loading}>
-						{#if $loading}
-							<Loader2 class="mr-2 h-4 w-4 animate-spin" />
-						{/if}
-						Refresh
-					</Button>
+					<div class="flex gap-2">
+						<Button variant="outline" size="sm" on:click={() => showTaskFormModal = true} disabled={!featureId}>
+							Add Task
+						</Button>
+						<Button variant="outline" size="sm" on:click={refreshTasks} disabled={$loading}>
+							{#if $loading}
+								<Loader2 class="mr-2 h-4 w-4 animate-spin" />
+							{/if}
+							Refresh
+						</Button>
+					</div>
 				</div>
 			</CardFooter>
 		</Card>
@@ -722,6 +950,25 @@
 			allowsText={questionData.allowsText !== false}
 			on:response={handleQuestionResponse}
 			on:cancel={handleQuestionCancel}
+		/>
+	{/if}
+
+	{#if featureId}
+		<TaskFormModal
+			open={showTaskFormModal}
+			featureId={featureId}
+			isEditing={isEditing}
+			editTask={editingTask ? {
+				id: editingTask.id,
+				title: editingTask.title || '',
+				effort: editingTask.effort || 'medium'
+			} : {
+				id: '',
+				title: '',
+				effort: 'medium'
+			}}
+			on:submit={handleTaskFormSubmit}
+			on:cancel={() => showTaskFormModal = false}
 		/>
 	{/if}
 </div>

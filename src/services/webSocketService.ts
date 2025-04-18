@@ -388,6 +388,63 @@ class WebSocketService {
   }
 
   /**
+   * Broadcasts a notification when a task is created
+   */
+  public notifyTaskCreated(featureId: string, task: any): void {
+    this.broadcast({
+      type: 'task_created',
+      featureId,
+      payload: {
+        task,
+        featureId,
+        createdAt: new Date().toISOString(),
+      },
+    })
+
+    logToFile(
+      `[WebSocketService] Broadcasted task_created for task ID: ${task.id}`
+    )
+  }
+
+  /**
+   * Broadcasts a notification when a task is updated
+   */
+  public notifyTaskUpdated(featureId: string, task: any): void {
+    this.broadcast({
+      type: 'task_updated',
+      featureId,
+      payload: {
+        task,
+        featureId,
+        updatedAt: new Date().toISOString(),
+      },
+    })
+
+    logToFile(
+      `[WebSocketService] Broadcasted task_updated for task ID: ${task.id}`
+    )
+  }
+
+  /**
+   * Broadcasts a notification when a task is deleted
+   */
+  public notifyTaskDeleted(featureId: string, taskId: string): void {
+    this.broadcast({
+      type: 'task_deleted',
+      featureId,
+      payload: {
+        taskId,
+        featureId,
+        deletedAt: new Date().toISOString(),
+      },
+    })
+
+    logToFile(
+      `[WebSocketService] Broadcasted task_deleted for task ID: ${taskId}`
+    )
+  }
+
+  /**
    * Sends a question to UI clients
    */
   public sendQuestion(

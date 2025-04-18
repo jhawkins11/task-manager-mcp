@@ -14,8 +14,9 @@ import planningStateService from './services/planningStateService'
 // Re-add static imports
 import express, { Request, Response } from 'express'
 import path from 'path'
+import crypto from 'crypto'
 
-import { readTasks } from './lib/fsUtils'
+import { readTasks, writeTasks } from './lib/fsUtils'
 import { FEATURE_TASKS_DIR, UI_PORT } from './config'
 import { Task } from './models/types'
 import { detectClarificationRequest } from './lib/llmUtils'
@@ -89,9 +90,9 @@ server.tool(
         const parentTask = tasks.find((t) => t.id === nextTask.parentTaskId)
         if (parentTask) {
           const parentDesc =
-            parentTask.description.length > 30
+            parentTask.description && parentTask.description.length > 30
               ? parentTask.description.substring(0, 30) + '...'
-              : parentTask.description
+              : parentTask.description || '' // Use empty string if description is undefined
           parentInfo = ` (Subtask of: "${parentDesc}")`
         } else {
           parentInfo = ` (Subtask of parent ID: ${nextTask.parentTaskId})` // Fallback if parent not found
@@ -346,6 +347,207 @@ async function main() {
             }`
           )
           res.status(500).json({ error: 'Failed to fetch tasks' })
+        }
+      })()
+    })
+
+    // Parse JSON bodies for API requests
+    app.use(express.json())
+
+    // POST: Create a new task
+    app.post('/api/tasks', (req: Request, res: Response) => {
+      ;(async () => {
+        try {
+          const { featureId, description, title, effort } = req.body
+
+          // Use title if description is missing
+          const taskDescription = description || title
+
+          if (!featureId || !taskDescription) {
+            return res.status(400).json({
+              error:
+                'Missing required fields: featureId and title are required',
+            })
+          }
+
+          // Read existing tasks
+          const tasks = await readTasks(featureId)
+
+          // Create a new task with a UUID
+          const newTask: Task = {
+            id: crypto.randomUUID(),
+            description: taskDescription,
+            title: title || taskDescription, // Use title or derived description
+            status: 'pending',
+            completed: false,
+            effort: effort as 'low' | 'medium' | 'high' | undefined,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }
+
+          // Add the new task to the list
+          tasks.push(newTask)
+
+          // Save the updated tasks
+          await writeTasks(featureId, tasks)
+
+          // Notify clients via WebSocket - both general task update and specific creation event
+          webSocketService.broadcast({
+            type: 'tasks_updated',
+            featureId,
+            payload: {
+              tasks: tasks.map((task) =>
+                formatTaskForFrontend(task, featureId)
+              ),
+              updatedAt: new Date().toISOString(),
+            },
+          })
+
+          // Also send a specific task created notification
+          webSocketService.notifyTaskCreated(
+            featureId,
+            formatTaskForFrontend(newTask, featureId)
+          )
+
+          res.status(201).json(formatTaskForFrontend(newTask, featureId))
+        } catch (error: any) {
+          await logToFile(
+            `[TaskServer] ERROR creating task: ${error?.message || error}`
+          )
+          res.status(500).json({ error: 'Failed to create task' })
+        }
+      })()
+    })
+
+    // PUT: Update an existing task
+    app.put('/api/tasks/:taskId', (req: Request, res: Response) => {
+      ;(async () => {
+        try {
+          const { taskId } = req.params
+          const { featureId, description, title, status, completed, effort } =
+            req.body
+
+          if (!featureId) {
+            return res
+              .status(400)
+              .json({ error: 'Missing required field: featureId' })
+          }
+
+          // Read existing tasks
+          const tasks = await readTasks(featureId)
+
+          // Find the task to update
+          const taskIndex = tasks.findIndex((task) => task.id === taskId)
+
+          if (taskIndex === -1) {
+            return res.status(404).json({ error: 'Task not found' })
+          }
+
+          // Prepare updated fields, using title for description if needed
+          const updatedTitle = title ?? tasks[taskIndex].title
+          const updatedDescription =
+            description ?? updatedTitle ?? tasks[taskIndex].description
+
+          // Update the task
+          tasks[taskIndex] = {
+            ...tasks[taskIndex],
+            description: updatedDescription,
+            title: updatedTitle,
+            status: status ?? tasks[taskIndex].status,
+            completed: completed ?? tasks[taskIndex].completed,
+            effort: effort ?? tasks[taskIndex].effort,
+            updatedAt: new Date().toISOString(),
+          }
+
+          // Save the updated tasks
+          await writeTasks(featureId, tasks)
+
+          // Notify clients via WebSocket - both general task update and specific update event
+          webSocketService.broadcast({
+            type: 'tasks_updated',
+            featureId,
+            payload: {
+              tasks: tasks.map((task) =>
+                formatTaskForFrontend(task, featureId)
+              ),
+              updatedAt: new Date().toISOString(),
+            },
+          })
+
+          // Send a specific task updated notification
+          webSocketService.notifyTaskUpdated(
+            featureId,
+            formatTaskForFrontend(tasks[taskIndex], featureId)
+          )
+
+          // Also send a status change notification if the status was updated
+          if (status) {
+            webSocketService.notifyTaskStatusChanged(featureId, taskId, status)
+          }
+
+          res.json(formatTaskForFrontend(tasks[taskIndex], featureId))
+        } catch (error: any) {
+          await logToFile(
+            `[TaskServer] ERROR updating task: ${error?.message || error}`
+          )
+          res.status(500).json({ error: 'Failed to update task' })
+        }
+      })()
+    })
+
+    // DELETE: Remove a task
+    app.delete('/api/tasks/:taskId', (req: Request, res: Response) => {
+      ;(async () => {
+        try {
+          const { taskId } = req.params
+          const { featureId } = req.query
+
+          if (!featureId) {
+            return res
+              .status(400)
+              .json({ error: 'Missing required query parameter: featureId' })
+          }
+
+          // Read existing tasks
+          const tasks = await readTasks(featureId as string)
+
+          // Find the task to delete
+          const taskIndex = tasks.findIndex((task) => task.id === taskId)
+
+          if (taskIndex === -1) {
+            return res.status(404).json({ error: 'Task not found' })
+          }
+
+          // Remove the task
+          const removedTask = tasks.splice(taskIndex, 1)[0]
+
+          // Save the updated tasks
+          await writeTasks(featureId as string, tasks)
+
+          // Notify clients via WebSocket - both general task update and specific deletion event
+          webSocketService.broadcast({
+            type: 'tasks_updated',
+            featureId: featureId as string,
+            payload: {
+              tasks: tasks.map((task) =>
+                formatTaskForFrontend(task, featureId as string)
+              ),
+              updatedAt: new Date().toISOString(),
+            },
+          })
+
+          // Send a specific task deleted notification
+          webSocketService.notifyTaskDeleted(featureId as string, taskId)
+
+          res.json({
+            message: 'Task deleted successfully',
+            task: formatTaskForFrontend(removedTask, featureId as string),
+          })
+        } catch (error: any) {
+          await logToFile(
+            `[TaskServer] ERROR deleting task: ${error?.message || error}`
+          )
+          res.status(500).json({ error: 'Failed to delete task' })
         }
       })()
     })

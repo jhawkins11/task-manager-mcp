@@ -59,6 +59,9 @@ export type WebSocketMessageType =
   | 'error'
   | 'connection_established'
   | 'client_registration'
+  | 'task_created'
+  | 'task_updated'
+  | 'task_deleted'
 
 export interface WebSocketMessage {
   type: WebSocketMessageType
@@ -78,4 +81,25 @@ export interface ShowQuestionPayload {
 export interface QuestionResponsePayload {
   questionId: string
   response: string
+}
+
+// Interface for task created event
+export interface TaskCreatedPayload {
+  task: Task
+  featureId: string
+  createdAt: string
+}
+
+// Interface for task updated event
+export interface TaskUpdatedPayload {
+  task: Task
+  featureId: string
+  updatedAt: string
+}
+
+// Interface for task deleted event
+export interface TaskDeletedPayload {
+  taskId: string
+  featureId: string
+  deletedAt: string
 }

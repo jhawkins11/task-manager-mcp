@@ -4,7 +4,7 @@ import { z } from 'zod'
 export const TaskSchema = z.object({
   id: z.string().uuid(),
   title: z.string().optional(),
-  description: z.string(),
+  description: z.string().optional(),
   status: z.enum(['pending', 'in_progress', 'completed', 'decomposed']),
   completed: z.boolean().default(false),
   effort: z.enum(['low', 'medium', 'high']).optional(),
@@ -138,6 +138,9 @@ export type WebSocketMessageType =
   | 'error'
   | 'connection_established'
   | 'client_registration'
+  | 'task_created'
+  | 'task_updated'
+  | 'task_deleted'
 
 export interface WebSocketMessage {
   type: WebSocketMessageType
@@ -188,6 +191,24 @@ export interface ClientRegistrationPayload {
 export interface ErrorPayload {
   code: string
   message: string
+}
+
+export interface TaskCreatedPayload {
+  task: Task
+  featureId: string
+  createdAt: string
+}
+
+export interface TaskUpdatedPayload {
+  task: Task
+  featureId: string
+  updatedAt: string
+}
+
+export interface TaskDeletedPayload {
+  taskId: string
+  featureId: string
+  deletedAt: string
 }
 
 // Schema for task breakdown response used in llmUtils.ts
