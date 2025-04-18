@@ -13,7 +13,8 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-pro-exp-03-25' // D
 const OPENROUTER_MODEL =
   process.env.OPENROUTER_MODEL || 'google/gemini-2.5-pro-exp-03-25:free'
 const FALLBACK_OPENROUTER_MODEL =
-  process.env.FALLBACK_OPENROUTER_MODEL || 'google/gemini-2.0-flash-001'
+  process.env.FALLBACK_OPENROUTER_MODEL ||
+  'google/gemini-2.5-flash-preview:thinking'
 const FALLBACK_GEMINI_MODEL =
   process.env.FALLBACK_GEMINI_MODEL || 'gemini-2.0-flash-thinking-exp-1219'
 const REVIEW_LLM_API_KEY = process.env.REVIEW_LLM_API_KEY || GEMINI_API_KEY
