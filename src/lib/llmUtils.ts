@@ -18,8 +18,9 @@ import { logToFile } from './logger'
 import { safetySettings, OPENROUTER_MODEL, GEMINI_MODEL } from '../config'
 import { z } from 'zod'
 import { encoding_for_model } from 'tiktoken'
-import { addHistoryEntry, writeTasks } from './fsUtils'
+import { addHistoryEntry } from './dbUtils'
 import webSocketService from '../services/webSocketService'
+import { databaseService } from '../services/databaseService'
 
 /**
  * Parses the text response from Gemini into a list of tasks.
@@ -617,11 +618,11 @@ export async function processAndBreakdownTasks(
 }
 
 /**
- * Centralized function to process a list of raw task steps, ensure effort,
- * breakdown complex tasks, save them, and notify the UI.
+ * Processes raw plan steps, ensures effort ratings are assigned, breaks down high-effort tasks,
+ * saves the final task list, and notifies WebSocket clients of the update.
  *
- * @param rawPlanSteps Raw task descriptions, potentially with effort tags.
- * @param model The LLM instance to use for processing.
+ * @param rawPlanSteps Array of task descriptions (format: "[effort] description").
+ * @param model The generative model to use for effort estimation/task breakdown.
  * @param featureId The ID of the feature being planned.
  * @returns The final list of processed Task objects.
  */
@@ -641,8 +642,69 @@ export async function processAndFinalizePlan(
       featureId
     )
 
-    // 3. Save the tasks
-    await writeTasks(featureId, finalTasks)
+    // 3. Save the tasks to the database
+    await databaseService.connect()
+
+    // First, get existing tasks to handle updates/deletions
+    const existingTasks = await databaseService.getTasksByFeatureId(featureId)
+    const existingTasksMap = new Map(
+      existingTasks.map((task) => [task.id, task])
+    )
+
+    // Process each final task
+    for (const task of finalTasks) {
+      // Convert timestamps if necessary
+      const now = Math.floor(Date.now() / 1000)
+      const taskWithTimestamps = {
+        ...task,
+        created_at: task.createdAt
+          ? typeof task.createdAt === 'string'
+            ? Math.floor(new Date(task.createdAt).getTime() / 1000)
+            : now
+          : now,
+        updated_at: task.updatedAt
+          ? typeof task.updatedAt === 'string'
+            ? Math.floor(new Date(task.updatedAt).getTime() / 1000)
+            : now
+          : now,
+        parent_task_id: task.parentTaskId,
+        feature_id: featureId,
+      }
+
+      // Check if this task already exists (by ID)
+      if (existingTasksMap.has(task.id)) {
+        // It's an update to an existing task
+        if (task.status !== existingTasksMap.get(task.id)!.status) {
+          // Status changed
+          await databaseService.updateTaskStatus(
+            task.id,
+            task.status,
+            task.completed
+          )
+        }
+
+        // Update other details
+        await databaseService.updateTaskDetails(task.id, {
+          title: task.title,
+          description: task.description,
+          effort: task.effort,
+          parent_task_id: task.parentTaskId,
+        })
+
+        // Remove from the map to track what's been processed
+        existingTasksMap.delete(task.id)
+      } else {
+        // It's a new task, add it
+        await databaseService.addTask(taskWithTimestamps)
+      }
+    }
+
+    // Any tasks still in existingTasksMap should be deleted as they weren't in finalTasks
+    for (const taskId of existingTasksMap.keys()) {
+      await databaseService.deleteTask(taskId)
+    }
+
+    await databaseService.close()
 
     // 4. Notify clients that tasks have been updated
     webSocketService.notifyTasksUpdated(featureId, finalTasks)

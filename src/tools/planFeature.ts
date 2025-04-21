@@ -18,7 +18,6 @@ import {
   processAndFinalizePlan,
 } from '../lib/llmUtils'
 import { logToFile } from '../lib/logger'
-import { readTasks, writeTasks, addHistoryEntry } from '../lib/fsUtils'
 import fs from 'fs/promises'
 import { exec } from 'child_process'
 import * as fsSync from 'fs'
@@ -28,6 +27,8 @@ import { z } from 'zod'
 import { GEMINI_MODEL, OPENROUTER_MODEL, WS_PORT, UI_PORT } from '../config'
 import { dynamicImportDefault } from '../lib/utils'
 import planningStateService from '../services/planningStateService'
+import { databaseService } from '../services/databaseService'
+import { addHistoryEntry } from '../lib/dbUtils'
 
 // Promisify child_process.exec for easier async/await usage
 const execPromise = promisify(exec)
@@ -808,7 +809,12 @@ export async function handlePlanFeature(
     let firstTaskDesc: string | undefined
     try {
       let updatedTasks: Task[] = []
-      updatedTasks = await readTasks(featureId) // Use readTasks instead of relying on potentially stale finalTasks
+
+      // Use databaseService instead of readTasks
+      await databaseService.connect()
+      updatedTasks = await databaseService.getTasksByFeatureId(featureId)
+      await databaseService.close()
+
       if (updatedTasks.length > 0) {
         const firstTask = updatedTasks[0]
         // Format the first task for the return message

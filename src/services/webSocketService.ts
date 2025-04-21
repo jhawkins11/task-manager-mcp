@@ -14,7 +14,7 @@ import {
 import planningStateService from '../services/planningStateService'
 import { aiService } from '../services/aiService'
 import { OPENROUTER_MODEL, GEMINI_MODEL } from '../config'
-import { addHistoryEntry, writeTasks } from '../lib/fsUtils'
+import { addHistoryEntry } from '../lib/dbUtils'
 import crypto from 'crypto'
 import {
   processAndBreakdownTasks,

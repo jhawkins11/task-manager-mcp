@@ -17,10 +17,11 @@ import express, { Request, Response, NextFunction } from 'express'
 import path from 'path'
 import crypto from 'crypto'
 
-import { readTasks, writeTasks } from './lib/fsUtils'
 import { FEATURE_TASKS_DIR, UI_PORT } from './config'
 import { Task } from './models/types'
 import { detectClarificationRequest } from './lib/llmUtils'
+import { databaseService } from './services/databaseService'
+import { addHistoryEntry } from './lib/dbUtils'
 
 // Immediately log that we're starting up
 logger.info('Starting task manager server...')
@@ -57,7 +58,9 @@ server.tool(
       )
 
       // 1. Read tasks for the given feature ID
-      const tasks = await readTasks(featureId)
+      await databaseService.connect()
+      const tasks = await databaseService.getTasksByFeatureId(featureId)
+      await databaseService.close()
 
       if (tasks.length === 0) {
         const message = `No tasks found for feature ID ${featureId}. The feature may not exist or has not been planned yet.`
@@ -86,9 +89,9 @@ server.tool(
 
       // Include parent info if this is a subtask
       let parentInfo = ''
-      if (nextTask.parentTaskId) {
+      if (nextTask.parent_task_id) {
         // Find the parent task
-        const parentTask = tasks.find((t) => t.id === nextTask.parentTaskId)
+        const parentTask = tasks.find((t) => t.id === nextTask.parent_task_id)
         if (parentTask) {
           const parentDesc =
             parentTask.description && parentTask.description.length > 30
@@ -96,7 +99,7 @@ server.tool(
               : parentTask.description || '' // Use empty string if description is undefined
           parentInfo = ` (Subtask of: "${parentDesc}")`
         } else {
-          parentInfo = ` (Subtask of parent ID: ${nextTask.parentTaskId})` // Fallback if parent not found
+          parentInfo = ` (Subtask of parent ID: ${nextTask.parent_task_id})` // Fallback if parent not found
         }
       }
 
@@ -273,16 +276,25 @@ async function listFeatures() {
 }
 
 // Helper function to format a task for the frontend
-function formatTaskForFrontend(task: Task, featureId: string) {
+function formatTaskForFrontend(task: any, featureId: string) {
   return {
-    ...task,
-    // Use task.title if available, otherwise fall back to description
+    id: task.id,
     title: task.title || task.description,
-    // Directly use the status from the task data, ensuring all statuses are handled
+    description: task.description,
     status: task.status,
-    // The 'completed' field should accurately reflect the 'completed' status
-    completed: task.status === 'completed',
+    completed: task.status === 'completed' || Boolean(task.completed),
+    effort: task.effort,
     feature_id: featureId,
+    // Convert from snake_case to camelCase for frontend compatibility
+    parentTaskId: task.parent_task_id,
+    createdAt:
+      typeof task.created_at === 'number'
+        ? new Date(task.created_at * 1000).toISOString()
+        : task.createdAt,
+    updatedAt:
+      typeof task.updated_at === 'number'
+        ? new Date(task.updated_at * 1000).toISOString()
+        : task.updatedAt,
   }
 }
 
@@ -347,7 +359,9 @@ async function main() {
       ;(async () => {
         const { featureId } = req.params
         try {
-          const tasks = await readTasks(featureId)
+          await databaseService.connect()
+          const tasks = await databaseService.getTasksByFeatureId(featureId)
+          await databaseService.close()
 
           // Use the helper function to format tasks
           const formattedTasks = tasks.map((task) =>
@@ -391,25 +405,28 @@ async function main() {
           }
 
           // Read existing tasks
-          const tasks = await readTasks(featureId)
+          await databaseService.connect()
+          const tasks = await databaseService.getTasksByFeatureId(featureId)
 
           // Create a new task with a UUID
-          const newTask: Task = {
+          const now = Math.floor(Date.now() / 1000)
+          const newTask = {
             id: crypto.randomUUID(),
             description: taskDescription,
             title: title || taskDescription, // Use title or derived description
-            status: 'pending',
+            status: 'pending' as const,
             completed: false,
             effort: effort as 'low' | 'medium' | 'high' | undefined,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+            feature_id: featureId,
+            created_at: now,
+            updated_at: now,
           }
 
-          // Add the new task to the list
-          tasks.push(newTask)
+          // Convert to DB format and add to database
+          await databaseService.addTask(newTask)
 
-          // Save the updated tasks
-          await writeTasks(featureId, tasks)
+          // Add the new task to the list for WS notifications
+          tasks.push(newTask)
 
           // Notify clients via WebSocket - both general task update and specific creation event
           webSocketService.broadcast({
@@ -429,6 +446,7 @@ async function main() {
             formatTaskForFrontend(newTask, featureId)
           )
 
+          await databaseService.close()
           res.status(201).json(formatTaskForFrontend(newTask, featureId))
         } catch (error: any) {
           logger.error(`Failed to create task: ${error?.message || error}`)
@@ -455,33 +473,41 @@ async function main() {
           }
 
           // Read existing tasks
-          const tasks = await readTasks(featureId)
+          await databaseService.connect()
 
-          // Find the task to update
-          const taskIndex = tasks.findIndex((task) => task.id === taskId)
+          // Check if task exists
+          const task = await databaseService.getTaskById(taskId)
 
-          if (taskIndex === -1) {
+          if (!task) {
+            await databaseService.close()
             return res.status(404).json({ error: 'Task not found' })
           }
 
-          // Prepare updated fields, using title for description if needed
-          const updatedTitle = title ?? tasks[taskIndex].title
-          const updatedDescription =
-            description ?? updatedTitle ?? tasks[taskIndex].description
-
-          // Update the task
-          tasks[taskIndex] = {
-            ...tasks[taskIndex],
-            description: updatedDescription,
-            title: updatedTitle,
-            status: status ?? tasks[taskIndex].status,
-            completed: completed ?? tasks[taskIndex].completed,
-            effort: effort ?? tasks[taskIndex].effort,
-            updatedAt: new Date().toISOString(),
+          // First determine what kind of update we need (status or details)
+          if (status || completed !== undefined) {
+            // Status update
+            const newStatus = status || task.status
+            const isCompleted =
+              completed !== undefined ? completed : task.completed
+            await databaseService.updateTaskStatus(
+              taskId,
+              newStatus,
+              isCompleted
+            )
           }
 
-          // Save the updated tasks
-          await writeTasks(featureId, tasks)
+          // If we have other fields to update, do that as well
+          if (title || description || effort) {
+            await databaseService.updateTaskDetails(taskId, {
+              title: title,
+              description: description,
+              effort: effort as 'low' | 'medium' | 'high' | undefined,
+            })
+          }
+
+          // Get updated tasks for WebSocket notification
+          const tasks = await databaseService.getTasksByFeatureId(featureId)
+          const updatedTask = await databaseService.getTaskById(taskId)
 
           // Notify clients via WebSocket - both general task update and specific update event
           webSocketService.broadcast({
@@ -498,7 +524,7 @@ async function main() {
           // Send a specific task updated notification
           webSocketService.notifyTaskUpdated(
             featureId,
-            formatTaskForFrontend(tasks[taskIndex], featureId)
+            formatTaskForFrontend(updatedTask!, featureId)
           )
 
           // Also send a status change notification if the status was updated
@@ -506,7 +532,8 @@ async function main() {
             webSocketService.notifyTaskStatusChanged(featureId, taskId, status)
           }
 
-          res.json(formatTaskForFrontend(tasks[taskIndex], featureId))
+          await databaseService.close()
+          res.json(formatTaskForFrontend(updatedTask!, featureId))
         } catch (error: any) {
           logger.error(`Failed to update task: ${error?.message || error}`)
           await logToFile(
@@ -530,28 +557,36 @@ async function main() {
               .json({ error: 'Missing required query parameter: featureId' })
           }
 
-          // Read existing tasks
-          const tasks = await readTasks(featureId as string)
+          // Connect to database
+          await databaseService.connect()
 
-          // Find the task to delete
-          const taskIndex = tasks.findIndex((task) => task.id === taskId)
+          // Get the task before deletion for the response
+          const task = await databaseService.getTaskById(taskId)
 
-          if (taskIndex === -1) {
+          if (!task) {
+            await databaseService.close()
             return res.status(404).json({ error: 'Task not found' })
           }
 
-          // Remove the task
-          const removedTask = tasks.splice(taskIndex, 1)[0]
+          // Delete the task
+          const deleted = await databaseService.deleteTask(taskId)
 
-          // Save the updated tasks
-          await writeTasks(featureId as string, tasks)
+          if (!deleted) {
+            await databaseService.close()
+            return res.status(404).json({ error: 'Failed to delete task' })
+          }
+
+          // Get updated tasks for WebSocket notification
+          const remainingTasks = await databaseService.getTasksByFeatureId(
+            featureId as string
+          )
 
           // Notify clients via WebSocket - both general task update and specific deletion event
           webSocketService.broadcast({
             type: 'tasks_updated',
             featureId: featureId as string,
             payload: {
-              tasks: tasks.map((task) =>
+              tasks: remainingTasks.map((task) =>
                 formatTaskForFrontend(task, featureId as string)
               ),
               updatedAt: new Date().toISOString(),
@@ -561,9 +596,10 @@ async function main() {
           // Send a specific task deleted notification
           webSocketService.notifyTaskDeleted(featureId as string, taskId)
 
+          await databaseService.close()
           res.json({
             message: 'Task deleted successfully',
-            task: formatTaskForFrontend(removedTask, featureId as string),
+            task: formatTaskForFrontend(task, featureId as string),
           })
         } catch (error: any) {
           logger.error(`Failed to delete task: ${error?.message || error}`)
@@ -662,7 +698,11 @@ async function main() {
 
           // Get tasks for the most recent feature
           const mostRecentFeatureId = featuresWithStats[0].featureId
-          const tasks = await readTasks(mostRecentFeatureId)
+          await databaseService.connect()
+          const tasks = await databaseService.getTasksByFeatureId(
+            mostRecentFeatureId
+          )
+          await databaseService.close()
 
           // Use the helper function to format tasks
           const formattedTasks = tasks.map((task) =>

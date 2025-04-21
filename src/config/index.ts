@@ -7,6 +7,9 @@ dotenv.config()
 
 // --- Configuration ---
 const FEATURE_TASKS_DIR = path.resolve(__dirname, '../../.mcp', 'features') // Directory for feature-specific task files
+const SQLITE_DB_PATH =
+  process.env.SQLITE_DB_PATH ||
+  path.resolve(__dirname, '../../data/taskmanager.db') // Path to SQLite database file
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-pro-exp-03-25' // Default model
@@ -48,6 +51,7 @@ const safetySettings = [
 
 export {
   FEATURE_TASKS_DIR,
+  SQLITE_DB_PATH,
   GEMINI_API_KEY,
   OPENROUTER_API_KEY,
   GEMINI_MODEL,

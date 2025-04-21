@@ -6,12 +6,7 @@ import {
   Task,
   TaskListSchema,
 } from '../models/types' // Assuming types.ts is in ../models
-import {
-  readTasks,
-  writeTasks,
-  readHistory,
-  addHistoryEntry,
-} from '../lib/fsUtils' // Corrected path for history utils as well
+import { addHistoryEntry } from '../lib/dbUtils' // Use the new dbUtils instead of fsUtils
 import { aiService } from '../services/aiService' // Import aiService
 import webSocketService from '../services/webSocketService' // Import the service instance
 import { OPENROUTER_MODEL } from '../config' // Assuming model config is here
@@ -24,6 +19,7 @@ import {
 import { GenerativeModel } from '@google/generative-ai' // Import types for model
 import OpenAI from 'openai' // Import OpenAI
 import planningStateService from '../services/planningStateService'
+import { databaseService } from '../services/databaseService'
 
 // Placeholder for the actual prompt construction logic
 async function constructAdjustmentPrompt(
@@ -138,13 +134,16 @@ export async function adjustPlanHandler(
     }
 
     // 1. Load current tasks and history
-    const currentTasks = await readTasks(featureId)
-    const history = await readHistory(featureId)
+    await databaseService.connect()
+    const currentTasks = await databaseService.getTasksByFeatureId(featureId)
+    const history = await databaseService.getHistoryByFeatureId(featureId)
+    await databaseService.close()
+
     // TODO: Retrieve the original feature request. This might need to be stored
     // alongside tasks or history, or retrieved from the initial history entry.
     const originalFeatureRequest =
       history.find(
-        (entry: HistoryEntry) =>
+        (entry) =>
           entry.role === 'user' &&
           typeof entry.content === 'string' &&
           entry.content.startsWith('Feature Request:')

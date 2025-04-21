@@ -1,7 +1,8 @@
 import { Task } from '../models/types'
-import { readTasks, writeTasks, addHistoryEntry } from '../lib/fsUtils'
 import { logToFile } from '../lib/logger'
 import webSocketService from '../services/webSocketService'
+import { databaseService } from '../services/databaseService'
+import { addHistoryEntry } from '../lib/dbUtils'
 
 interface MarkTaskCompleteParams {
   task_id: string
@@ -11,6 +12,17 @@ interface MarkTaskCompleteParams {
 interface MarkTaskCompleteResult {
   content: Array<{ type: string; text: string }>
   isError?: boolean
+}
+
+/**
+ * Maps database task objects (with snake_case properties) to application Task objects (with camelCase)
+ */
+function mapDatabaseTaskToAppTask(dbTask: any): Task {
+  return {
+    ...dbTask,
+    feature_id: dbTask.feature_id,
+    parentTaskId: dbTask.parent_task_id,
+  }
 }
 
 /**
@@ -32,7 +44,11 @@ export async function handleMarkTaskComplete(
       params: { task_id, feature_id },
     })
 
-    const tasks = await readTasks(feature_id)
+    await databaseService.connect()
+    const dbTasks = await databaseService.getTasksByFeatureId(feature_id)
+    // Map database tasks to application tasks
+    const tasks = dbTasks.map(mapDatabaseTaskToAppTask)
+
     let taskFound = false
     let alreadyCompleted = false
     let isSubtask = false
@@ -58,6 +74,7 @@ export async function handleMarkTaskComplete(
     let isError = false
 
     if (tasks.length === 0) {
+      await databaseService.close()
       await logToFile(
         `[TaskServer] No tasks found for feature ID: ${feature_id}`
       )
@@ -75,6 +92,7 @@ export async function handleMarkTaskComplete(
     }
 
     if (!taskFound) {
+      await databaseService.close()
       await logToFile(
         `[TaskServer] Task ${task_id} not found in feature: ${feature_id}`
       )
@@ -112,23 +130,23 @@ export async function handleMarkTaskComplete(
         )
 
         if (allSubtasksComplete) {
-          // Auto-update the parent task status to 'decomposed'
-          const finalTasks = updatedTasks.map((task) => {
-            if (task.id === parentTaskId) {
-              console.error(
-                `[TaskServer] Setting parent task ${parentTaskId} to 'decomposed' as all subtasks are complete.`
-              )
-              // Parent is decomposed, not completed
-              return {
-                ...task,
-                status: 'decomposed' as const,
-                completed: false,
-              }
-            }
-            return task
-          })
+          // Update task status in database
+          await databaseService.updateTaskStatus(task_id, 'completed', true)
 
-          await writeTasks(feature_id, finalTasks)
+          // Auto-update the parent task status to 'decomposed'
+          await databaseService.updateTaskStatus(
+            parentTaskId,
+            'decomposed',
+            false
+          )
+
+          // Get updated tasks after database operations
+          const dbFinalTasks = await databaseService.getTasksByFeatureId(
+            feature_id
+          )
+          // Map database tasks to application tasks
+          const finalTasks = dbFinalTasks.map(mapDatabaseTaskToAppTask)
+          await databaseService.close()
 
           // Broadcast task updates via WebSocket
           try {
@@ -173,12 +191,22 @@ export async function handleMarkTaskComplete(
         }
       }
 
-      // Pass the correctly mapped array directly
-      await writeTasks(feature_id, updatedTasks)
+      // Update task status in database
+      await databaseService.updateTaskStatus(task_id, 'completed', true)
+
+      // Get updated tasks after database operations
+      const dbFinalUpdatedTasks = await databaseService.getTasksByFeatureId(
+        feature_id
+      )
+      // Map database tasks to application tasks
+      const finalUpdatedTasks = dbFinalUpdatedTasks.map(
+        mapDatabaseTaskToAppTask
+      )
+      await databaseService.close()
 
       // Broadcast task updates via WebSocket
       try {
-        webSocketService.notifyTasksUpdated(feature_id, updatedTasks)
+        webSocketService.notifyTasksUpdated(feature_id, finalUpdatedTasks)
         webSocketService.notifyTaskStatusChanged(
           feature_id,
           task_id,
