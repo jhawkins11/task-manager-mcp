@@ -16,6 +16,7 @@ interface Task {
   parent_task_id?: string
   created_at: number
   updated_at: number
+  fromReview?: boolean
 }
 
 // Define interface for task updates
@@ -24,6 +25,7 @@ interface TaskUpdate {
   description?: string
   effort?: 'low' | 'medium' | 'high'
   parent_task_id?: string
+  fromReview?: boolean
 }
 
 // Define History Entry type for database operations
@@ -385,9 +387,6 @@ class DatabaseService {
           'DELETE FROM task_relationships WHERE parent_id = ? OR child_id = ?',
           [taskId, taskId]
         )
-
-        // Delete any task history entries
-        await this.run('DELETE FROM task_history WHERE task_id = ?', [taskId])
 
         // Finally delete the task
         const result = await this.run('DELETE FROM tasks WHERE id = ?', [

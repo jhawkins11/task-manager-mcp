@@ -22,11 +22,21 @@ const FALLBACK_GEMINI_MODEL =
   process.env.FALLBACK_GEMINI_MODEL || 'gemini-2.0-flash-thinking-exp-1219'
 const REVIEW_LLM_API_KEY = process.env.REVIEW_LLM_API_KEY || GEMINI_API_KEY
 
+// Logging configuration
+type LogLevel = 'debug' | 'info' | 'warn' | 'error'
+const LOG_LEVEL = (process.env.LOG_LEVEL?.toLowerCase() as LogLevel) || 'info' // Default to INFO
+
 // WebSocket server configuration
 const WS_PORT = parseInt(process.env.WS_PORT || '4999', 10)
 const WS_HOST = process.env.WS_HOST || 'localhost'
 // UI server uses the same port as WebSocket
 const UI_PORT = WS_PORT
+
+// Add config for git diff max buffer (in MB)
+const GIT_DIFF_MAX_BUFFER_MB = parseInt(
+  process.env.GIT_DIFF_MAX_BUFFER_MB || '10',
+  10
+)
 
 // Define safety settings for content generation
 import { HarmCategory, HarmBlockThreshold } from '@google/generative-ai'
@@ -59,8 +69,11 @@ export {
   FALLBACK_OPENROUTER_MODEL,
   FALLBACK_GEMINI_MODEL,
   REVIEW_LLM_API_KEY,
+  LOG_LEVEL,
+  LogLevel,
   safetySettings,
   WS_PORT,
   WS_HOST,
   UI_PORT,
+  GIT_DIFF_MAX_BUFFER_MB,
 }

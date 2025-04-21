@@ -29,6 +29,7 @@ import { dynamicImportDefault } from '../lib/utils'
 import planningStateService from '../services/planningStateService'
 import { databaseService } from '../services/databaseService'
 import { addHistoryEntry } from '../lib/dbUtils'
+import { getCodebaseContext } from '../lib/repomixUtils'
 
 // Promisify child_process.exec for easier async/await usage
 const execPromise = promisify(exec)
@@ -113,175 +114,31 @@ export async function handlePlanFeature(
       }
     }
 
-    // --- Repomix Execution ---
-    let codebaseContext = ''
-    try {
-      const targetDir = project_path || '.'
-      const repomixOutputPath = path.join(targetDir, 'repomix-output.txt')
-      // Ensure the output directory exists (needed if targetDir is nested and doesn't exist yet)
-      await fs.mkdir(path.dirname(repomixOutputPath), { recursive: true })
+    // --- Get Codebase Context using Utility Function ---
+    const targetDir = project_path || '.' // Keep targetDir logic
+    const { context: codebaseContext, error: contextError } =
+      await getCodebaseContext(
+        targetDir,
+        featureId // Use featureId as log context
+      )
 
-      let command = `npx repomix ${targetDir} --style plain --output ${repomixOutputPath}`
-
-      console.error(`[TaskServer] Running repomix command: ${command}`)
-      await logToFile(`[TaskServer] Running repomix command: ${command}`)
-
-      let { stdout, stderr } = await execPromise(command, {
-        maxBuffer: 10 * 1024 * 1024,
-      })
-
-      if (stderr) {
-        await logToFile(`[TaskServer] repomix stderr: ${stderr}`)
-        if (stderr.includes('Permission denied')) {
-          message = `Error running repomix: Permission denied scanning directory '${targetDir}'. Check folder permissions.`
-          isError = true
-          await addHistoryEntry(featureId, 'tool_response', {
-            tool: 'plan_feature',
-            isError: true,
-            message,
-            step: 'repomix_execution',
-          })
-          return { content: [{ type: 'text', text: message }], isError }
-        }
-      }
-      if (!stdout && !(await fs.stat(repomixOutputPath).catch(() => null))) {
-        await logToFile(
-          '[TaskServer] repomix stdout was empty and output file does not exist.'
-        )
-        // Handle case where repomix might not produce output but doesn't error
-      }
-
-      // Read repomix-output.txt (handle potential non-existence)
-      try {
-        codebaseContext = await fs.readFile(repomixOutputPath, 'utf-8')
-      } catch (readError: any) {
-        if (readError.code === 'ENOENT') {
-          await logToFile(
-            `[TaskServer] repomix-output.txt not found at ${repomixOutputPath}. Proceeding without context.`
-          )
-          codebaseContext = '' // Proceed without context if file missing
-        } else {
-          throw readError // Re-throw other read errors
-        }
-      }
-
-      if (!codebaseContext.trim()) {
-        await logToFile(
-          `[TaskServer] repomix output file (${repomixOutputPath}) was empty or missing.`
-        )
-        codebaseContext = '' // Ensure it's an empty string if no content
-      }
-
-      // Check token count (only if context exists)
-      if (codebaseContext) {
-        let tokenCount = 0
-        try {
-          const enc = encoding_for_model('gpt-4') // Or appropriate model
-          tokenCount = enc.encode(codebaseContext).length
-          enc.free()
-        } catch (tokenError) {
-          await logToFile(
-            `[TaskServer] Token counting failed, using approximation: ${tokenError}`
-          )
-          tokenCount = Math.ceil(codebaseContext.length / 4)
-        }
-
-        const TOKEN_LIMIT = 1000000 // Example limit
-
-        if (tokenCount > TOKEN_LIMIT) {
-          await logToFile(
-            `[TaskServer] Repomix output too large (${tokenCount.toLocaleString()} tokens). Re-running with --compress flag.`
-          )
-          command = `npx repomix ${targetDir} --style plain --compress --output ${repomixOutputPath}`
-          console.error(
-            `[TaskServer] Re-running repomix with compression: ${command}`
-          )
-          await logToFile(
-            `[TaskServer] Re-running repomix command with compression: ${command}`
-          )
-
-          const compressResult = await execPromise(command, {
-            maxBuffer: 10 * 1024 * 1024,
-          })
-          if (compressResult.stderr) {
-            await logToFile(
-              `[TaskServer] repomix (compressed) stderr: ${compressResult.stderr}`
-            )
-          }
-
-          try {
-            codebaseContext = await fs.readFile(repomixOutputPath, 'utf-8')
-          } catch (readError: any) {
-            if (readError.code === 'ENOENT') {
-              await logToFile(
-                `[TaskServer] Compressed repomix-output.txt not found at ${repomixOutputPath}. Proceeding without context.`
-              )
-              codebaseContext = ''
-            } else {
-              throw readError
-            }
-          }
-
-          if (!codebaseContext.trim()) {
-            await logToFile(
-              `[TaskServer] Compressed repomix output file (${repomixOutputPath}) was empty or missing.`
-            )
-            codebaseContext = ''
-          } else {
-            let compressedTokenCount = 0
-            try {
-              const enc = encoding_for_model('gpt-4')
-              compressedTokenCount = enc.encode(codebaseContext).length
-              enc.free()
-              await logToFile(
-                `[TaskServer] Compressed output token count: ${compressedTokenCount.toLocaleString()}`
-              )
-            } catch (tokenError) {
-              await logToFile(
-                `[TaskServer] Compressed token counting failed: ${tokenError}`
-              )
-            }
-            await logToFile(
-              `[TaskServer] Compressed repomix context gathered (${
-                codebaseContext.length
-              } chars, ~${compressedTokenCount.toLocaleString()} tokens) for path: ${targetDir}.`
-            )
-          }
-        } else {
-          await logToFile(
-            `[TaskServer] repomix context gathered (${
-              codebaseContext.length
-            } chars, ${tokenCount.toLocaleString()} tokens) for path: ${targetDir}.`
-          )
-        }
-      } else {
-        await logToFile(
-          `[TaskServer] No codebase context gathered (repomix output was empty or missing).`
-        )
-      }
-    } catch (error: any) {
-      await logToFile(`[TaskServer] Error running repomix: ${error}`)
-      let errorMessage = 'Error running repomix to gather codebase context.'
-      if (error.message?.includes('command not found')) {
-        errorMessage =
-          "Error: 'npx' or 'repomix' command not found. Make sure Node.js and repomix are installed and in the PATH."
-      } else if (error.stderr?.includes('Permission denied')) {
-        errorMessage = `Error running repomix: Permission denied scanning directory. Check folder permissions.`
-      }
-      message = errorMessage
+    // Handle potential errors from getCodebaseContext
+    if (contextError) {
+      message = contextError // Use the user-friendly error from the utility
       isError = true
       await addHistoryEntry(featureId, 'tool_response', {
         tool: 'plan_feature',
         isError: true,
         message,
-        step: 'repomix_execution',
-        error:
-          error instanceof Error
-            ? { message: error.message, stack: error.stack }
-            : String(error),
+        step: 'repomix_context_gathering',
       })
       return { content: [{ type: 'text', text: message }], isError }
     }
+
+    // Optional: Add token counting / compression logic here if needed,
+    // operating on the returned `codebaseContext`.
+    // This part is kept separate from the core getCodebaseContext utility for now.
+    // ... (Token counting and compression logic could go here)
 
     // --- LLM Planning & Task Generation ---
     let planSteps: string[] = []

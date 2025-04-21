@@ -624,58 +624,122 @@ export async function processAndBreakdownTasks(
  * @param rawPlanSteps Array of task descriptions (format: "[effort] description").
  * @param model The generative model to use for effort estimation/task breakdown.
  * @param featureId The ID of the feature being planned.
+ * @param fromReview Optional flag to set fromReview: true on all saved tasks.
  * @returns The final list of processed Task objects.
  */
 export async function processAndFinalizePlan(
   rawPlanSteps: string[],
   model: GenerativeModel | OpenAI | null,
-  featureId: string
+  featureId: string,
+  fromReview?: boolean
 ): Promise<Task[]> {
+  await logToFile(
+    `[processAndFinalizePlan] Starting for feature ${featureId} with ${rawPlanSteps.length} raw steps.`
+  )
   try {
     // 1. Ensure effort ratings
+    await logToFile(`[processAndFinalizePlan] Ensuring effort ratings...`)
     const effortRatedSteps = await ensureEffortRatings(rawPlanSteps, model)
+    await logToFile(`[processAndFinalizePlan] Effort ratings ensured.`)
 
     // 2. Process and breakdown tasks
+    await logToFile(
+      `[processAndFinalizePlan] Processing and breaking down tasks...`
+    )
     const { finalTasks } = await processAndBreakdownTasks(
       effortRatedSteps,
       model,
       featureId
     )
+    await logToFile(
+      `[processAndFinalizePlan] Breakdown complete. ${finalTasks.length} final tasks generated.`
+    )
 
     // 3. Save the tasks to the database
+    await logToFile(`[processAndFinalizePlan] Connecting to database...`)
     await databaseService.connect()
+    await logToFile(
+      `[processAndFinalizePlan] Database connected. Fetching existing tasks...`
+    )
 
     // First, get existing tasks to handle updates/deletions
     const existingTasks = await databaseService.getTasksByFeatureId(featureId)
+    await logToFile(
+      `[processAndFinalizePlan] Found ${existingTasks.length} existing tasks for feature ${featureId}.`
+    )
     const existingTasksMap = new Map(
       existingTasks.map((task) => [task.id, task])
     )
 
     // Process each final task
+    await logToFile(
+      `[processAndFinalizePlan] Processing ${finalTasks.length} final tasks...`
+    )
     for (const task of finalTasks) {
-      // Convert timestamps if necessary
+      await logToFile(`[processAndFinalizePlan] Processing task ID: ${task.id}`)
       const now = Math.floor(Date.now() / 1000)
+      let taskCreatedAt: number
+      let taskUpdatedAt: number
+      try {
+        // Helper function to convert timestamp
+        const convertTimestamp = (ts: string | number | undefined): number => {
+          if (typeof ts === 'number') return ts // Already a number
+          if (typeof ts === 'string') {
+            // Check if it's a numeric string (potential epoch seconds)
+            const numericVal = Number(ts)
+            if (!isNaN(numericVal) && isFinite(numericVal)) {
+              // Assume it's epoch seconds if it looks like one (e.g., 10 digits)
+              // More robust checks could be added (e.g., range check)
+              if (String(numericVal).length >= 10) {
+                return Math.floor(numericVal)
+              }
+            }
+            // Otherwise, assume it's an ISO date string
+            const dateVal = new Date(ts)
+            if (!isNaN(dateVal.getTime())) {
+              // Check if Date parsing was successful
+              return Math.floor(dateVal.getTime() / 1000)
+            }
+          }
+          return now // Default to current time if conversion fails
+        }
+
+        taskCreatedAt = convertTimestamp(task.createdAt)
+        taskUpdatedAt = convertTimestamp(task.updatedAt)
+      } catch (tsError: any) {
+        await logToFile(
+          `[processAndFinalizePlan] Error converting timestamp for task ${task.id}: ${tsError.message}`
+        )
+        // Assign default timestamp on error to avoid crashing
+        taskCreatedAt = now
+        taskUpdatedAt = now
+      }
+
       const taskWithTimestamps = {
         ...task,
-        created_at: task.createdAt
-          ? typeof task.createdAt === 'string'
-            ? Math.floor(new Date(task.createdAt).getTime() / 1000)
-            : now
-          : now,
-        updated_at: task.updatedAt
-          ? typeof task.updatedAt === 'string'
-            ? Math.floor(new Date(task.updatedAt).getTime() / 1000)
-            : now
-          : now,
+        fromReview: fromReview ? true : task.fromReview,
+        created_at: taskCreatedAt,
+        updated_at: taskUpdatedAt,
         parent_task_id: task.parentTaskId,
         feature_id: featureId,
       }
 
       // Check if this task already exists (by ID)
       if (existingTasksMap.has(task.id)) {
+        await logToFile(
+          `[processAndFinalizePlan] Updating existing task ID: ${task.id}`
+        )
+        const existingTask = existingTasksMap.get(task.id)!
+
+        // Determine the correct fromReview status: preserve existing if true, otherwise use the parameter
+        const finalFromReview =
+          existingTask.fromReview || (fromReview ? true : false)
+
         // It's an update to an existing task
-        if (task.status !== existingTasksMap.get(task.id)!.status) {
-          // Status changed
+        if (task.status !== existingTask.status) {
+          await logToFile(
+            `[processAndFinalizePlan] Updating status for task ${task.id} from ${existingTask.status} to ${task.status}`
+          )
           await databaseService.updateTaskStatus(
             task.id,
             task.status,
@@ -683,40 +747,65 @@ export async function processAndFinalizePlan(
           )
         }
 
-        // Update other details
+        // Update other details, including the potentially preserved fromReview status
+        await logToFile(
+          `[processAndFinalizePlan] Updating details for task ${task.id}`
+        )
         await databaseService.updateTaskDetails(task.id, {
           title: task.title,
           description: task.description,
           effort: task.effort,
           parent_task_id: task.parentTaskId,
+          fromReview: finalFromReview, // Pass the determined status
         })
 
         // Remove from the map to track what's been processed
         existingTasksMap.delete(task.id)
       } else {
+        await logToFile(
+          `[processAndFinalizePlan] Adding new task ID: ${task.id}`
+        )
         // It's a new task, add it
         await databaseService.addTask(taskWithTimestamps)
       }
+      await logToFile(
+        `[processAndFinalizePlan] Finished processing task ID: ${task.id}`
+      )
     }
 
     // Any tasks still in existingTasksMap should be deleted as they weren't in finalTasks
-    for (const taskId of existingTasksMap.keys()) {
-      await databaseService.deleteTask(taskId)
+    if (existingTasksMap.size > 0) {
+      await logToFile(
+        `[processAndFinalizePlan] Deleting ${existingTasksMap.size} tasks not present in the final plan...`
+      )
+      for (const taskId of existingTasksMap.keys()) {
+        await logToFile(`[processAndFinalizePlan] Deleting task ID: ${taskId}`)
+        await databaseService.deleteTask(taskId)
+      }
+      await logToFile(`[processAndFinalizePlan] Finished deleting tasks.`)
     }
 
+    await logToFile(`[processAndFinalizePlan] Closing database connection...`)
     await databaseService.close()
+    await logToFile(`[processAndFinalizePlan] Database connection closed.`)
 
     // 4. Notify clients that tasks have been updated
+    await logToFile(`[processAndFinalizePlan] Notifying WebSocket clients...`)
     webSocketService.notifyTasksUpdated(featureId, finalTasks)
+    await logToFile(`[processAndFinalizePlan] WebSocket clients notified.`)
 
     logToFile(
-      `[processAndFinalizePlan] Processed ${finalTasks.length} final tasks for feature ${featureId}`
+      `[processAndFinalizePlan] Successfully processed ${finalTasks.length} final tasks for feature ${featureId}`
     )
 
     return finalTasks
   } catch (error: any) {
-    logToFile(
-      `[processAndFinalizePlan] Error processing plan for feature ${featureId}: ${error.message}`
+    // Improved error logging
+    await logToFile(
+      `[processAndFinalizePlan] Error processing plan for feature ${featureId}. Error: ${JSON.stringify(
+        error,
+        Object.getOwnPropertyNames(error)
+      )}`
     )
     // Re-throw the error to be handled by the specific caller context
     throw error

@@ -154,7 +154,7 @@ Add the following entry to the mcpServers object within that JSON file:
 5. Recommended Instructions for Agent: Paste these rules exactly into the "Custom Instructions" text box:
 
 ```
-Always use plan_feature mcp tool when getting feature request before doing anything else. ALWAYS!!!!!!!! It will return the first step of the implementation. DO NOT IMPLEMENT MORE THAN WHAT THE TASK STATES. After you're done run mark_task_complete which will give you the next task. If the user says "review" use the review_changes tool.
+Always use plan_feature mcp tool when getting feature request before doing anything else. ALWAYS!!!!!!!! It will return the first step of the implementation. DO NOT IMPLEMENT MORE THAN WHAT THE TASK STATES. After you're done run mark_task_complete which will give you the next task. If the user says "review" use the review_changes tool. The review_changes tool will generate new tasks for you to follow, just like plan_feature. After a review, follow the same one-at-a-time task completion workflow: complete each review-generated task, mark it complete, and call get_next_task until all are done.
 
 If clarification is required at any step, you will not receive the next task and will have to run get_next_task manually after the user answers the clarification question through the UI.
 

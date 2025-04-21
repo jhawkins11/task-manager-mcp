@@ -9,3 +9,4 @@ frontend/build/
 frontend/.svelte-kit/
 .DS_Store
 tsconfig.tsbuildinfo
+*.db

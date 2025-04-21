@@ -12,6 +12,7 @@ export const TaskSchema = z.object({
   parentTaskId: z.string().uuid().optional(),
   createdAt: z.string().optional(),
   updatedAt: z.string().optional(),
+  fromReview: z.boolean().optional(),
 })
 
 export const TaskListSchema = z.array(TaskSchema)
@@ -328,4 +329,22 @@ export const IntermediatePlanningStateSchema = z.object({
 
 export type IntermediatePlanningState = z.infer<
   typeof IntermediatePlanningStateSchema
+>
+
+// Schema for review response with tasks (for review_changes tool)
+export const ReviewResponseWithTasksSchema = z.object({
+  tasks: z
+    .array(
+      z.object({
+        description: z.string().describe('Description of the task to be done'),
+        effort: z
+          .enum(['low', 'medium', 'high'])
+          .describe('Estimated effort level for this task'),
+      })
+    )
+    .describe('List of tasks generated from code review'),
+})
+
+export type ReviewResponseWithTasks = z.infer<
+  typeof ReviewResponseWithTasksSchema
 >

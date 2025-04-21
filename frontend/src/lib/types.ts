@@ -13,6 +13,7 @@ export interface Task {
   createdAt?: string
   updatedAt?: string
   children?: Task[]
+  fromReview?: boolean
 }
 
 /**

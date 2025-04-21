@@ -178,17 +178,35 @@ server.tool(
 )
 
 // 3. Tool: review_changes
-server.tool('review_changes', {}, async (_args, _extra) => {
-  const result = await handleReviewChanges()
-  // Transform the content to match SDK expected format
-  return {
-    content: result.content.map((item) => ({
-      type: item.type as 'text',
-      text: item.text,
-    })),
-    isError: result.isError,
+server.tool(
+  'review_changes',
+  {
+    project_path: z
+      .string()
+      .optional()
+      .describe(
+        'The absolute path to the project directory where git commands should run. Defaults to the workspace root if not provided.'
+      ),
+    featureId: z
+      .string()
+      .uuid({ message: 'Valid feature ID (UUID) is required.' }),
+  },
+  async (args, _extra) => {
+    // Pass the project_path argument to the handler
+    const result = await handleReviewChanges({
+      featureId: args.featureId,
+      project_path: args.project_path,
+    })
+    // Transform the content to match SDK expected format
+    return {
+      content: result.content.map((item) => ({
+        type: item.type as 'text',
+        text: item.text,
+      })),
+      isError: result.isError,
+    }
   }
-})
+)
 
 // 4. Tool: adjust_plan
 server.tool(

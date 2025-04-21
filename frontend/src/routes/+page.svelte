@@ -8,7 +8,7 @@
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Select from '$lib/components/ui/select';
 	import { Progress } from '$lib/components/ui/progress';
-	import { Loader2, CornerDownLeft, CornerDownRight, Pencil, Trash2 } from 'lucide-svelte';
+	import { Loader2, CornerDownLeft, CornerDownRight, Pencil, Trash2, FileText } from 'lucide-svelte';
 	import { writable, type Writable } from 'svelte/store';
 	import type { Task, WebSocketMessage, ShowQuestionPayload, QuestionResponsePayload } from '$lib/types';
 	import { TaskStatus, TaskEffort } from '$lib/types';
@@ -812,6 +812,11 @@
 									>
 										{task.title}
 									</label>
+									{#if task.fromReview}
+										<span title="Review task">
+											<FileText class="text-blue-500 inline-block ml-1" size={16} />
+										</span>
+									{/if}
 								</div>
 								{#if task.description && task.description !== task.title}
 									<p class="text-sm text-muted-foreground">
@@ -882,6 +887,11 @@
 												>
 													{childTask.title}
 												</label>
+												{#if childTask.fromReview}
+													<span title="Review task">
+														<FileText class="text-blue-500 inline-block ml-1" size={16} />
+													</span>
+												{/if}
 											</div>
 											{#if childTask.description && childTask.description !== childTask.title}
 												<p class="text-sm text-muted-foreground">
