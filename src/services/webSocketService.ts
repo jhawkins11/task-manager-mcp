@@ -551,7 +551,7 @@ class WebSocketService {
       )
 
       // Get the stored planning state
-      const state = planningStateService.getStateByQuestionId(questionId)
+      const state = await planningStateService.getStateByQuestionId(questionId)
 
       if (!state) {
         logToFile(
@@ -813,7 +813,7 @@ class WebSocketService {
       )
 
       // Clean up the temporary state
-      planningStateService.clearState(questionId)
+      await planningStateService.clearState(questionId)
 
       // Add success history entry (notification/saving is now handled within processAndFinalizePlan)
       await addHistoryEntry(featureId, 'tool_response', {

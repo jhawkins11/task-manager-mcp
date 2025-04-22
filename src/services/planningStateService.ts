@@ -1,14 +1,18 @@
 import { IntermediatePlanningState } from '../models/types'
 import { logToFile } from '../lib/logger'
 import crypto from 'crypto'
+import {
+  addPlanningState,
+  getPlanningStateByQuestionId,
+  getPlanningStateByFeatureId,
+  clearPlanningState,
+  clearPlanningStatesForFeature,
+} from '../lib/dbUtils'
 
 /**
  * Service for managing intermediate planning state when LLM needs clarification
  */
 class PlanningStateService {
-  // In-memory store for intermediate planning states
-  private planningStates: Map<string, IntermediatePlanningState> = new Map()
-
   /**
    * Stores intermediate planning state when LLM needs clarification
    *
@@ -18,31 +22,22 @@ class PlanningStateService {
    * @param planningType The type of planning operation (feature planning or adjustment)
    * @returns The generated question ID
    */
-  storeIntermediateState(
+  async storeIntermediateState(
     featureId: string,
     prompt: string,
     partialResponse: string,
     planningType: 'feature_planning' | 'plan_adjustment'
-  ): string {
+  ): Promise<string> {
     try {
-      // Generate a unique question ID
-      const questionId = crypto.randomUUID()
-
-      const state: IntermediatePlanningState = {
+      const questionId = await addPlanningState(
         featureId,
         prompt,
         partialResponse,
-        questionId,
-        planningType,
-      }
-
-      this.planningStates.set(questionId, state)
+        planningType
+      )
 
       logToFile(
         `[PlanningStateService] Stored intermediate state for question ${questionId}, feature ${featureId}`
-      )
-      logToFile(
-        `[PlanningStateService] Current active planning states: ${this.planningStates.size}`
       )
 
       return questionId
@@ -61,7 +56,9 @@ class PlanningStateService {
    * @param questionId The ID of the clarification question
    * @returns The intermediate planning state if found, null otherwise
    */
-  getStateByQuestionId(questionId: string): IntermediatePlanningState | null {
+  async getStateByQuestionId(
+    questionId: string
+  ): Promise<IntermediatePlanningState | null> {
     try {
       if (!questionId) {
         logToFile(
@@ -70,7 +67,7 @@ class PlanningStateService {
         return null
       }
 
-      const state = this.planningStates.get(questionId)
+      const state = await getPlanningStateByQuestionId(questionId)
 
       if (!state) {
         logToFile(
@@ -79,11 +76,20 @@ class PlanningStateService {
         return null
       }
 
+      // Map the database planning state to IntermediatePlanningState
+      const intermediateState: IntermediatePlanningState = {
+        questionId: state.questionId,
+        featureId: state.featureId,
+        prompt: state.prompt,
+        partialResponse: state.partialResponse,
+        planningType: state.planningType,
+      }
+
       logToFile(
         `[PlanningStateService] Retrieved intermediate state for question ${questionId}, feature ${state.featureId}`
       )
 
-      return state
+      return intermediateState
     } catch (error: any) {
       logToFile(
         `[PlanningStateService] Error retrieving state for question ${questionId}: ${error.message}`
@@ -98,7 +104,9 @@ class PlanningStateService {
    * @param featureId The feature ID
    * @returns The intermediate planning state if found, null otherwise
    */
-  getStateByFeatureId(featureId: string): IntermediatePlanningState | null {
+  async getStateByFeatureId(
+    featureId: string
+  ): Promise<IntermediatePlanningState | null> {
     try {
       if (!featureId) {
         logToFile(
@@ -107,20 +115,29 @@ class PlanningStateService {
         return null
       }
 
-      // Find the first state with matching feature ID
-      for (const state of this.planningStates.values()) {
-        if (state.featureId === featureId) {
-          logToFile(
-            `[PlanningStateService] Retrieved intermediate state for feature ${featureId}`
-          )
-          return state
-        }
+      const state = await getPlanningStateByFeatureId(featureId)
+
+      if (!state) {
+        logToFile(
+          `[PlanningStateService] No intermediate state found for feature ${featureId}`
+        )
+        return null
+      }
+
+      // Map the database planning state to IntermediatePlanningState
+      const intermediateState: IntermediatePlanningState = {
+        questionId: state.questionId,
+        featureId: state.featureId,
+        prompt: state.prompt,
+        partialResponse: state.partialResponse,
+        planningType: state.planningType,
       }
 
       logToFile(
-        `[PlanningStateService] No intermediate state found for feature ${featureId}`
+        `[PlanningStateService] Retrieved intermediate state for feature ${featureId}`
       )
-      return null
+
+      return intermediateState
     } catch (error: any) {
       logToFile(
         `[PlanningStateService] Error retrieving state for feature ${featureId}: ${error.message}`
@@ -135,7 +152,7 @@ class PlanningStateService {
    * @param questionId The ID of the clarification question
    * @returns True if the state was cleared, false if not found
    */
-  clearState(questionId: string): boolean {
+  async clearState(questionId: string): Promise<boolean> {
     try {
       if (!questionId) {
         logToFile(
@@ -144,23 +161,25 @@ class PlanningStateService {
         return false
       }
 
-      const exists = this.planningStates.has(questionId)
+      // Get the state first to log the feature ID
+      const state = await this.getStateByQuestionId(questionId)
 
-      if (exists) {
-        const state = this.planningStates.get(questionId)
-        this.planningStates.delete(questionId)
+      if (!state) {
         logToFile(
-          `[PlanningStateService] Cleared intermediate state for question ${questionId}, feature ${state?.featureId}`
+          `[PlanningStateService] No intermediate state to clear for question ${questionId}`
         )
+        return false
+      }
+
+      const cleared = await clearPlanningState(questionId)
+
+      if (cleared) {
         logToFile(
-          `[PlanningStateService] Remaining active planning states: ${this.planningStates.size}`
+          `[PlanningStateService] Cleared intermediate state for question ${questionId}, feature ${state.featureId}`
         )
         return true
       }
 
-      logToFile(
-        `[PlanningStateService] No intermediate state to clear for question ${questionId}`
-      )
       return false
     } catch (error: any) {
       logToFile(
@@ -176,7 +195,7 @@ class PlanningStateService {
    * @param featureId The feature ID to clear states for
    * @returns Number of states cleared
    */
-  clearStatesForFeature(featureId: string): number {
+  async clearStatesForFeature(featureId: string): Promise<number> {
     try {
       if (!featureId) {
         logToFile(
@@ -185,27 +204,10 @@ class PlanningStateService {
         return 0
       }
 
-      let count = 0
-      const questionIdsToRemove: string[] = []
-
-      // Find all states with matching feature ID
-      for (const [questionId, state] of this.planningStates.entries()) {
-        if (state.featureId === featureId) {
-          questionIdsToRemove.push(questionId)
-        }
-      }
-
-      // Remove collected question IDs
-      for (const questionId of questionIdsToRemove) {
-        this.planningStates.delete(questionId)
-        count++
-      }
+      const count = await clearPlanningStatesForFeature(featureId)
 
       logToFile(
         `[PlanningStateService] Cleared ${count} intermediate states for feature ${featureId}`
-      )
-      logToFile(
-        `[PlanningStateService] Remaining active planning states: ${this.planningStates.size}`
       )
 
       return count

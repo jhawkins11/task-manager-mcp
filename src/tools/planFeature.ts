@@ -95,12 +95,18 @@ export async function handlePlanFeature(
       message = 'Error: Planning model not initialized. Check API Key.'
       isError = true
 
-      // Record error in history
-      await addHistoryEntry(featureId, 'tool_response', {
-        tool: 'plan_feature',
-        isError: true,
-        message,
-      })
+      // Record error in history, handling potential logging errors
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'plan_feature',
+          isError: true,
+          message,
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add error history entry during model init failure: ${historyError}`
+        )
+      }
 
       // Return the structured error object *serialized*
       const errorResponse: PlanFeatureStandardResponse = {
@@ -126,12 +132,19 @@ export async function handlePlanFeature(
     if (contextError) {
       message = contextError // Use the user-friendly error from the utility
       isError = true
-      await addHistoryEntry(featureId, 'tool_response', {
-        tool: 'plan_feature',
-        isError: true,
-        message,
-        step: 'repomix_context_gathering',
-      })
+      // Record error in history, handling potential logging errors
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'plan_feature',
+          isError: true,
+          message,
+          step: 'repomix_context_gathering',
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add error history entry during context gathering failure: ${historyError}`
+        )
+      }
       return { content: [{ type: 'text', text: message }], isError }
     }
 
@@ -227,12 +240,13 @@ export async function handlePlanFeature(
             }
 
             // Store the intermediate state
-            const questionId = planningStateService.storeIntermediateState(
-              featureId,
-              structuredPlanningPrompt,
-              JSON.stringify(structuredResult.data),
-              'feature_planning'
-            )
+            const questionId =
+              await planningStateService.storeIntermediateState(
+                featureId,
+                structuredPlanningPrompt,
+                JSON.stringify(structuredResult.data),
+                'feature_planning'
+              )
             // Send WebSocket message
             webSocketService.broadcast({
               type: 'show_question',
@@ -336,12 +350,19 @@ export async function handlePlanFeature(
             message =
               'Error: Failed to get planning response from LLM or response was blocked. AI Agent: Do not try to call again. Simply alert the user.'
             isError = true
-            await addHistoryEntry(featureId, 'tool_response', {
-              tool: 'plan_feature',
-              isError: true,
-              message,
-              step: 'llm_response_processing',
-            })
+            // Record error in history, handling potential logging errors
+            try {
+              await addHistoryEntry(featureId, 'tool_response', {
+                tool: 'plan_feature',
+                isError: true,
+                message,
+                step: 'llm_response_processing',
+              })
+            } catch (historyError) {
+              console.error(
+                `[TaskServer] Failed to add error history entry during LLM processing failure: ${historyError}`
+              )
+            }
             return { content: [{ type: 'text', text: message }], isError }
           }
 
@@ -361,12 +382,19 @@ export async function handlePlanFeature(
               message =
                 'Error: The planning model did not return a recognizable list of tasks.'
               isError = true
-              await addHistoryEntry(featureId, 'tool_response', {
-                tool: 'plan_feature',
-                isError: true,
-                message,
-                step: 'response_parsing',
-              })
+              // Record error in history, handling potential logging errors
+              try {
+                await addHistoryEntry(featureId, 'tool_response', {
+                  tool: 'plan_feature',
+                  isError: true,
+                  message,
+                  step: 'response_parsing',
+                })
+              } catch (historyError) {
+                console.error(
+                  `[TaskServer] Failed to add error history entry during response parsing failure: ${historyError}`
+                )
+              }
               const errorResponse: PlanFeatureStandardResponse = {
                 status: 'error',
                 message: message,
@@ -421,12 +449,13 @@ export async function handlePlanFeature(
             }
 
             // Store the intermediate state
-            const questionId = planningStateService.storeIntermediateState(
-              featureId,
-              structuredPlanningPrompt,
-              JSON.stringify(structuredResult.data),
-              'feature_planning'
-            )
+            const questionId =
+              await planningStateService.storeIntermediateState(
+                featureId,
+                structuredPlanningPrompt,
+                JSON.stringify(structuredResult.data),
+                'feature_planning'
+              )
             // Send WebSocket message
             webSocketService.broadcast({
               type: 'show_question',
@@ -533,12 +562,19 @@ export async function handlePlanFeature(
             message =
               'Error: Failed to get planning response from LLM or response was blocked. AI Agent: Do not try to call again. Simply alert the user.'
             isError = true
-            await addHistoryEntry(featureId, 'tool_response', {
-              tool: 'plan_feature',
-              isError: true,
-              message,
-              step: 'llm_response_processing',
-            })
+            // Record error in history, handling potential logging errors
+            try {
+              await addHistoryEntry(featureId, 'tool_response', {
+                tool: 'plan_feature',
+                isError: true,
+                message,
+                step: 'llm_response_processing',
+              })
+            } catch (historyError) {
+              console.error(
+                `[TaskServer] Failed to add error history entry during LLM processing failure: ${historyError}`
+              )
+            }
             return { content: [{ type: 'text', text: message }], isError }
           }
 
@@ -558,12 +594,19 @@ export async function handlePlanFeature(
               message =
                 'Error: The planning model did not return a recognizable list of tasks.'
               isError = true
-              await addHistoryEntry(featureId, 'tool_response', {
-                tool: 'plan_feature',
-                isError: true,
-                message,
-                step: 'response_parsing',
-              })
+              // Record error in history, handling potential logging errors
+              try {
+                await addHistoryEntry(featureId, 'tool_response', {
+                  tool: 'plan_feature',
+                  isError: true,
+                  message,
+                  step: 'response_parsing',
+                })
+              } catch (historyError) {
+                console.error(
+                  `[TaskServer] Failed to add error history entry during response parsing failure: ${historyError}`
+                )
+              }
               const errorResponse: PlanFeatureStandardResponse = {
                 status: 'error',
                 message: message,
@@ -603,13 +646,19 @@ export async function handlePlanFeature(
       isError = true
       await logToFile(`[TaskServer] ${message} Stack: ${error.stack}`)
 
-      // Record error in history
-      await addHistoryEntry(featureId, 'tool_response', {
-        tool: 'plan_feature',
-        isError: true,
-        message: error.message,
-        step: 'planning_execution', // Indicate where the error occurred
-      })
+      // Record error in history, handling potential logging errors
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'plan_feature',
+          isError: true,
+          message: error.message,
+          step: 'planning_execution', // Indicate where the error occurred
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add error history entry during planning execution failure: ${historyError}`
+        )
+      }
     }
   } catch (outerError: any) {
     // Catch errors happening before LLM call (e.g., history writing)

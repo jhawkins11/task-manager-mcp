@@ -89,6 +89,11 @@ FALLBACK_OPENROUTER_MODEL=google/gemini-2.5-flash-preview:thinking
 # Default is 4999 if not set.
 UI_PORT=4999
 WS_PORT=4999
+
+# === Auto Review ===
+# If true, the agent will automatically run the 'review' tool after the last task is completed.
+# Defaults to false.
+AUTO_REVIEW_ON_COMPLETION=false
 ```
 
 ## Avoiding Costs

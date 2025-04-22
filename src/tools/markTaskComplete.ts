@@ -3,6 +3,7 @@ import { logToFile } from '../lib/logger'
 import webSocketService from '../services/webSocketService'
 import { databaseService } from '../services/databaseService'
 import { addHistoryEntry } from '../lib/dbUtils'
+import { AUTO_REVIEW_ON_COMPLETION } from '../config'
 
 interface MarkTaskCompleteParams {
   task_id: string
@@ -32,239 +33,234 @@ export async function handleMarkTaskComplete(
   params: MarkTaskCompleteParams
 ): Promise<MarkTaskCompleteResult> {
   const { task_id, feature_id } = params
+  let message: string = ''
+  let isError = false
+  let finalTasks: Task[] = [] // Hold the final state of tasks for reporting
+  let taskStatusUpdate: any = { isError: false, status: 'unknown' }
 
   await logToFile(
     `[TaskServer] Handling mark_task_complete request for ID: ${task_id} in feature: ${feature_id}`
   )
 
+  // Record initial tool call attempt
   try {
-    // Record tool call in history
     await addHistoryEntry(feature_id, 'tool_call', {
       tool: 'mark_task_complete',
       params: { task_id, feature_id },
     })
+  } catch (historyError) {
+    console.error(
+      `[TaskServer] Failed to add initial history entry: ${historyError}`
+    )
+    // Potentially return error here if initial logging is critical
+    // For now, we log and continue
+  }
 
+  try {
+    // --- Database Operations Block ---
     await databaseService.connect()
-    const dbTasks = await databaseService.getTasksByFeatureId(feature_id)
-    // Map database tasks to application tasks
-    const tasks = dbTasks.map(mapDatabaseTaskToAppTask)
+    try {
+      const dbTasks = await databaseService.getTasksByFeatureId(feature_id)
+      const tasks = dbTasks.map(mapDatabaseTaskToAppTask)
+      finalTasks = [...tasks] // Initialize finalTasks with current state
 
-    let taskFound = false
-    let alreadyCompleted = false
-    let isSubtask = false
-    let parentTaskId: string | undefined = undefined
-
-    const updatedTasks = tasks.map((task) => {
-      if (task.id === task_id) {
-        taskFound = true
-        if (task.status === 'completed') {
-          console.error(`[TaskServer] Task ${task_id} already completed.`)
-          alreadyCompleted = true
-        }
-        if (task.parentTaskId) {
-          isSubtask = true
-          parentTaskId = task.parentTaskId
-        }
-        return { ...task, status: 'completed' as const }
-      }
-      return task
-    })
-
-    let message: string
-    let isError = false
-
-    if (tasks.length === 0) {
-      await databaseService.close()
-      await logToFile(
-        `[TaskServer] No tasks found for feature ID: ${feature_id}`
-      )
-      message = `Error: No tasks found for feature ID ${feature_id}. The feature may not exist or has not been planned yet.`
-      isError = true
-
-      // Record error in history
-      await addHistoryEntry(feature_id, 'tool_response', {
-        tool: 'mark_task_complete',
-        isError: true,
-        message,
-      })
-
-      return { content: [{ type: 'text', text: message }], isError }
-    }
-
-    if (!taskFound) {
-      await databaseService.close()
-      await logToFile(
-        `[TaskServer] Task ${task_id} not found in feature: ${feature_id}`
-      )
-      message = `Error: Task with ID ${task_id} not found in feature ${feature_id}.`
-      isError = true
-
-      // Record error in history
-      await addHistoryEntry(feature_id, 'tool_response', {
-        tool: 'mark_task_complete',
-        isError: true,
-        message,
-      })
-
-      return { content: [{ type: 'text', text: message }], isError }
-    } else if (alreadyCompleted) {
-      message = `Task ${task_id} was already marked as complete.`
-
-      // Record "already completed" response in history
-      await addHistoryEntry(feature_id, 'tool_response', {
-        tool: 'mark_task_complete',
-        isError: false,
-        message,
-        taskId: task_id,
-        status: 'already_completed',
-      })
-    } else {
-      // Check if this is a subtask and if all sibling subtasks are now complete
-      if (isSubtask && parentTaskId) {
-        // Get all subtasks for this parent
-        const siblingTasks = updatedTasks.filter(
-          (task) => task.parentTaskId === parentTaskId
-        )
-        const allSubtasksComplete = siblingTasks.every(
-          (task) => task.status === 'completed'
-        )
-
-        if (allSubtasksComplete) {
-          // Update task status in database
-          await databaseService.updateTaskStatus(task_id, 'completed', true)
-
-          // Auto-update the parent task status to 'decomposed'
-          await databaseService.updateTaskStatus(
-            parentTaskId,
-            'decomposed',
-            false
-          )
-
-          // Get updated tasks after database operations
-          const dbFinalTasks = await databaseService.getTasksByFeatureId(
-            feature_id
-          )
-          // Map database tasks to application tasks
-          const finalTasks = dbFinalTasks.map(mapDatabaseTaskToAppTask)
-          await databaseService.close()
-
-          // Broadcast task updates via WebSocket
-          try {
-            webSocketService.notifyTasksUpdated(feature_id, finalTasks)
-            webSocketService.notifyTaskStatusChanged(
-              feature_id,
-              task_id,
-              'completed' // The subtask itself is completed
+      if (tasks.length === 0) {
+        message = `Error: No tasks found for feature ID ${feature_id}.`
+        isError = true
+        taskStatusUpdate = { isError: true, status: 'feature_not_found' }
+        // No further DB ops needed, exit the inner try block
+      } else {
+        const taskIndex = tasks.findIndex((task) => task.id === task_id)
+        if (taskIndex === -1) {
+          message = `Error: Task with ID ${task_id} not found in feature ${feature_id}.`
+          isError = true
+          taskStatusUpdate = { isError: true, status: 'task_not_found' }
+        } else {
+          const taskToUpdate = tasks[taskIndex]
+          if (taskToUpdate.status === 'completed') {
+            message = `Task ${task_id} was already marked as complete.`
+            isError = false // Not an error, just informational
+            taskStatusUpdate = {
+              isError: false,
+              status: 'already_completed',
+              taskId: task_id,
+            }
+            // No DB update needed, but update finalTasks for consistency
+            finalTasks = [...tasks]
+          } else {
+            // Mark the task as completed locally first for checks
+            finalTasks = tasks.map((task) =>
+              task.id === task_id
+                ? { ...task, status: 'completed' as const }
+                : task
             )
-            webSocketService.notifyTaskStatusChanged(
-              feature_id,
-              parentTaskId!,
-              'decomposed' // Parent is now decomposed
+
+            // Perform the actual database update for the main task
+            await databaseService.updateTaskStatus(task_id, 'completed', true)
+            message = `Task ${task_id} marked as complete.`
+            taskStatusUpdate = {
+              isError: false,
+              status: 'completed',
+              taskId: task_id,
+            }
+            logToFile(
+              `[TaskServer] Task ${task_id} DB status updated to completed.`
             )
-            await logToFile(
-              `[TaskServer] Broadcast tasks_updated and status_changed events for feature ${feature_id}`
+
+            // Check for parent task completion
+            if (taskToUpdate.parentTaskId) {
+              const parentId = taskToUpdate.parentTaskId
+              const siblingTasks = finalTasks.filter(
+                (t) => t.parentTaskId === parentId && t.id !== task_id // Exclude current task if needed, already marked completed
+              )
+              const allSubtasksComplete = siblingTasks.every(
+                (st) => st.status === 'completed'
+              )
+
+              if (allSubtasksComplete) {
+                logToFile(
+                  `[TaskServer] All subtasks for parent ${parentId} complete. Updating parent.`
+                )
+                await databaseService.updateTaskStatus(
+                  parentId,
+                  'decomposed',
+                  false
+                )
+                // Update parent status in our finalTasks list as well
+                finalTasks = finalTasks.map((task) =>
+                  task.id === parentId
+                    ? { ...task, status: 'decomposed' as const }
+                    : task
+                )
+                message += ` Parent task ${parentId} status updated as all subtasks are now complete.`
+                taskStatusUpdate = {
+                  isError: false,
+                  status: 'completed_with_parent_decomposed',
+                  taskId: task_id,
+                  parentTaskId: parentId,
+                }
+                logToFile(
+                  `[TaskServer] Parent task ${parentId} DB status updated to decomposed.`
+                )
+              }
+            }
+
+            // Fetch final state *after* all updates
+            const dbFinalState = await databaseService.getTasksByFeatureId(
+              feature_id
             )
-          } catch (wsError) {
-            await logToFile(
-              `[TaskServer] Warning: Failed to broadcast task update: ${wsError}`
-            )
-            // Don't fail the operation if WebSocket broadcast fails
+            finalTasks = dbFinalState.map(mapDatabaseTaskToAppTask)
+            logToFile(`[TaskServer] Final task state fetched after updates.`)
           }
-
-          await logToFile(
-            `[TaskServer] Task ${task_id} marked as complete. Parent task ${parentTaskId} status set to decomposed.`
-          )
-          message = `Task ${task_id} marked as complete. Parent task ${parentTaskId} status updated as all subtasks are now complete.`
-
-          // Record success with parent update in history
-          await addHistoryEntry(feature_id, 'tool_response', {
-            tool: 'mark_task_complete',
-            isError: false,
-            message,
-            taskId: task_id,
-            parentTaskId,
-            status: 'completed_with_parent_decomposed', // Updated status key
-          })
-
-          // Now find the next task (using the finalTasks list)
-          return getNextTaskAfterCompletion(finalTasks, message, feature_id)
         }
       }
-
-      // Update task status in database
-      await databaseService.updateTaskStatus(task_id, 'completed', true)
-
-      // Get updated tasks after database operations
-      const dbFinalUpdatedTasks = await databaseService.getTasksByFeatureId(
-        feature_id
-      )
-      // Map database tasks to application tasks
-      const finalUpdatedTasks = dbFinalUpdatedTasks.map(
-        mapDatabaseTaskToAppTask
-      )
-      await databaseService.close()
-
-      // Broadcast task updates via WebSocket
+    } finally {
+      // Ensure DB connection is closed
       try {
-        webSocketService.notifyTasksUpdated(feature_id, finalUpdatedTasks)
-        webSocketService.notifyTaskStatusChanged(
-          feature_id,
-          task_id,
-          'completed'
+        await databaseService.close()
+        logToFile(`[TaskServer] Database connection closed successfully.`)
+      } catch (closeError) {
+        console.error(
+          `[TaskServer] Error closing database connection: ${closeError}`
         )
-        await logToFile(
-          `[TaskServer] Broadcast tasks_updated and status_changed events for feature ${feature_id}`
+        // Don't mask the original error if one occurred
+        if (!isError) {
+          message = `Error closing database: ${closeError}`
+          isError = true
+          taskStatusUpdate = { isError: true, status: 'db_close_error' }
+        }
+      }
+    }
+    // --- End Database Operations Block ---
+
+    // --- Post-DB Operations (History, WS, Response) ---
+
+    // Broadcast updates via WebSocket if DB ops were successful (or partially successful)
+    if (
+      taskStatusUpdate.status !== 'unknown' &&
+      taskStatusUpdate.status !== 'feature_not_found' &&
+      taskStatusUpdate.status !== 'task_not_found'
+    ) {
+      try {
+        webSocketService.notifyTasksUpdated(feature_id, finalTasks)
+        if (
+          taskStatusUpdate.status === 'completed' ||
+          taskStatusUpdate.status === 'completed_with_parent_decomposed'
+        ) {
+          webSocketService.notifyTaskStatusChanged(
+            feature_id,
+            task_id,
+            'completed'
+          )
+        }
+        if (
+          taskStatusUpdate.status === 'completed_with_parent_decomposed' &&
+          taskStatusUpdate.parentTaskId
+        ) {
+          webSocketService.notifyTaskStatusChanged(
+            feature_id,
+            taskStatusUpdate.parentTaskId,
+            'decomposed'
+          )
+        }
+        logToFile(
+          `[TaskServer] Broadcast WebSocket events for feature ${feature_id}`
         )
       } catch (wsError) {
-        await logToFile(
+        logToFile(
           `[TaskServer] Warning: Failed to broadcast task update: ${wsError}`
         )
-        // Don't fail the operation if WebSocket broadcast fails
+        // Don't fail the overall operation
       }
-
-      await logToFile(`[TaskServer] Task ${task_id} marked as complete.`)
-      message = `Task ${task_id} marked as complete.`
-
-      // Record success in history
-      await addHistoryEntry(feature_id, 'tool_response', {
-        tool: 'mark_task_complete',
-        isError: false,
-        message,
-        taskId: task_id,
-        status: 'completed',
-      })
     }
 
-    // Find the next task after completion
-    return getNextTaskAfterCompletion(updatedTasks, message, feature_id)
+    // Record final outcome in history
+    try {
+      await addHistoryEntry(feature_id, 'tool_response', {
+        tool: 'mark_task_complete',
+        isError: isError,
+        message: message,
+        ...taskStatusUpdate, // Add status details
+      })
+    } catch (historyError) {
+      console.error(
+        `[TaskServer] Failed to add final history entry: ${historyError}`
+      )
+      // If history fails here, the main operation still succeeded or failed as determined before
+    }
+
+    // If there was an error identified during DB ops, return error now
+    if (isError) {
+      return { content: [{ type: 'text', text: message }], isError: true }
+    }
+
+    // If successful, find and return the next task
+    return getNextTaskAfterCompletion(finalTasks, message, feature_id)
   } catch (error) {
+    // Catch errors from the main DB block or other unexpected issues
     const errorMsg = `Error processing mark_task_complete request: ${
       error instanceof Error ? error.message : String(error)
     }`
-    console.error(`[TaskServer] ${errorMsg}`)
+    console.error(`[TaskServer] ${errorMsg}`, error)
+    isError = true
+    message = errorMsg
 
-    // Record error in history
+    // Record error in history (attempt)
     try {
       await addHistoryEntry(feature_id, 'tool_response', {
         tool: 'mark_task_complete',
         isError: true,
         message: errorMsg,
-        taskId: task_id,
-        error:
-          error instanceof Error
-            ? { message: error.message, stack: error.stack }
-            : String(error),
+        error: error instanceof Error ? error.message : String(error),
+        status: 'processing_error',
       })
     } catch (historyError) {
       console.error(
-        `[TaskServer] Failed to record error in history: ${historyError}`
+        `[TaskServer] Failed to add error history entry during failure: ${historyError}`
       )
     }
 
-    return {
-      content: [{ type: 'text', text: errorMsg }],
-      isError: true,
-    }
+    return { content: [{ type: 'text', text: message }], isError: true }
   }
 }
 
@@ -283,18 +279,36 @@ async function getNextTaskAfterCompletion(
     await logToFile(
       `[TaskServer] No pending tasks remaining for feature ID: ${featureId}`
     )
-    const message = `${completionMessage}\n\nAll tasks have been completed for this feature.`
 
-    // Record completion in history
-    await addHistoryEntry(featureId, 'tool_response', {
+    let message = `${completionMessage}\n\nAll tasks have been completed for this feature.`
+    const historyPayload: any = {
       tool: 'mark_task_complete',
       isError: false,
-      message,
+      message: message, // Keep original message for history
       status: 'all_completed',
-    })
+    }
+    let resultPayload: any = [{ type: 'text', text: message }]
+
+    // Check if auto-review is enabled
+    if (AUTO_REVIEW_ON_COMPLETION) {
+      await logToFile(
+        `[TaskServer] Auto-review enabled for feature ${featureId}`
+      )
+      // Modify message and payload for auto-review
+      message = `${message}\n\nInitiating automatic review...` // Update message for response
+      historyPayload.status = 'all_completed_auto_review' // Update history status
+      historyPayload.autoReviewTriggered = true
+      resultPayload = [
+        { type: 'text', text: message }, // Send updated message
+        { type: 'tool_code', text: 'review' }, // Instruct client to run review
+      ]
+    }
+
+    // Record completion/review trigger in history
+    await addHistoryEntry(featureId, 'tool_response', historyPayload)
 
     return {
-      content: [{ type: 'text', text: message }],
+      content: resultPayload,
     }
   }
 

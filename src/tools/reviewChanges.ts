@@ -1,59 +1,90 @@
-import { logToFile } from '../lib/logger'
+// src/tools/reviewChanges.ts
+
+import { logToFile } from '../lib/logger' // Use specific log functions
 import { aiService } from '../services/aiService'
 import { promisify } from 'util'
 import { exec } from 'child_process'
 import crypto from 'crypto'
-import { CodeReviewSchema, CodeReview } from '../models/types'
+// Import the correct schema for task list output
+import { PlanFeatureResponseSchema, Task } from '../models/types'
 import { z } from 'zod'
 import {
   parseAndValidateJsonResponse,
-  processAndFinalizePlan,
+  processAndFinalizePlan, // We WILL use this now
 } from '../lib/llmUtils'
 import {
   GIT_DIFF_MAX_BUFFER_MB,
-  GEMINI_MODEL,
-  OPENROUTER_MODEL,
+  GEMINI_MODEL, // Make sure these are imported if needed directly
+  OPENROUTER_MODEL, // Make sure these are imported if needed directly
 } from '../config'
-const { ReviewResponseWithTasksSchema } = require('../models/types')
 import path from 'path'
-import fs from 'fs/promises'
 import { getCodebaseContext } from '../lib/repomixUtils'
+import { addHistoryEntry, getHistoryForFeature } from '../lib/dbUtils'
 
-// Promisify child_process.exec for easier async/await usage
 const execPromise = promisify(exec)
 
-/**
- * Schema for structured code review output
- */
-const CodeReviewResponseSchema = CodeReviewSchema
-
 interface ReviewChangesParams {
-  featureId: string // Required feature ID (UUID)
-  project_path?: string // Add optional project_path
+  featureId: string // Make featureId mandatory
+  project_path?: string
+}
+
+// Use the standard response type
+interface PlanFeatureStandardResponse {
+  status: 'completed' | 'awaiting_clarification' | 'error'
+  message: string
+  featureId: string
+  taskCount?: number
+  firstTask?: Task | { description: string; effort: string } // Allow slightly different structure if needed
+  uiUrl?: string
+  data?: any // For clarification details or other metadata
 }
 
 interface ReviewChangesResult {
-  content: Array<{ type: string; text: string }>
+  content: Array<{ type: 'text'; text: string }>
   isError?: boolean
 }
 
-/**
- * Handles the review_changes tool request
- */
 export async function handleReviewChanges(
-  params: ReviewChangesParams // Update parameter type
+  params: ReviewChangesParams
 ): Promise<ReviewChangesResult> {
-  await logToFile('[TaskServer] Handling review_changes request...')
+  const { featureId, project_path } = params
+  const reviewId = crypto.randomUUID() // Unique ID for this review operation
 
-  const { featureId, project_path } = params // Destructure featureId and project_path
+  logToFile(
+    `[TaskServer] Handling review_changes request for feature ${featureId} (Review ID: ${reviewId})`
+  )
+  // Wrap initial history logging
+  try {
+    await addHistoryEntry(featureId, 'tool_call', {
+      tool: 'review_changes',
+      params,
+      reviewId,
+    })
+  } catch (historyError) {
+    console.error(
+      `[TaskServer] Failed to add initial history entry for review: ${historyError}`
+    )
+    // Continue execution even if initial history fails
+  }
 
-  // --- Path Validation ---
-  let targetDir = '.' // Default to current directory
+  let targetDir = process.cwd()
   if (project_path) {
     // Basic check for path traversal characters
     if (project_path.includes('..') || project_path.includes('~')) {
       const errorMsg = `Error: Invalid project_path provided: ${project_path}. Path cannot contain '..' or '~'.`
       await logToFile(`[TaskServer] ${errorMsg}`)
+      // Try to log error to history before returning
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'review_changes',
+          isError: true,
+          message: errorMsg,
+          reviewId,
+          step: 'invalid_path',
+        })
+      } catch (historyError) {
+        /* Ignore */
+      }
       return { content: [{ type: 'text', text: errorMsg }], isError: true }
     }
 
@@ -65,51 +96,73 @@ export async function handleReviewChanges(
     if (!resolvedPath.startsWith(cwd)) {
       const errorMsg = `Error: Invalid project_path provided: ${project_path}. Path must be within the current workspace.`
       await logToFile(`[TaskServer] ${errorMsg}`)
+      // Try to log error to history before returning
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'review_changes',
+          isError: true,
+          message: errorMsg,
+          reviewId,
+          step: 'invalid_path',
+        })
+      } catch (historyError) {
+        /* Ignore */
+      }
       return { content: [{ type: 'text', text: errorMsg }], isError: true }
     }
-    targetDir = resolvedPath // Use the validated, absolute path
-  } else {
-    targetDir = process.cwd() // Use absolute path for default case too
+    targetDir = resolvedPath
   }
 
-  // Generate a review ID to track this specific review session
-  const reviewId = crypto.randomUUID()
-
   try {
-    // Can't record history for a specific feature as we don't have featureId here
-    console.error(`[TaskServer] Recording review request with ID: ${reviewId}`)
-
-    let message: string
+    let message: string | null = null
     let isError = false
 
     const reviewModel = aiService.getReviewModel()
-
     if (!reviewModel) {
-      await logToFile(
-        '[TaskServer] Review model not initialized (check API key).',
-        'error'
-      )
       message = 'Error: Review model not initialized. Check API Key.'
       isError = true
+      logToFile(`[TaskServer] ${message} (Review ID: ${reviewId})`)
+      // Wrap history logging
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'review_changes',
+          isError,
+          message,
+          reviewId,
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add history entry for model init failure: ${historyError}`
+        )
+      }
       return { content: [{ type: 'text', text: message }], isError }
     }
 
-    // --- Get Codebase Context using Utility Function ---
+    // --- Get Codebase Context --- (Keep as is)
     const { context: codebaseContext, error: contextError } =
-      await getCodebaseContext(
-        targetDir,
-        reviewId // Use reviewId as log context
-      )
-
-    // Handle potential errors from getCodebaseContext
+      await getCodebaseContext(targetDir, reviewId)
     if (contextError) {
-      message = contextError // Use the user-friendly error from the utility
+      message = contextError
       isError = true
-      // Note: Consider adding history entry here if needed
+      // Wrap history logging
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'review_changes',
+          isError,
+          message,
+          reviewId,
+          step: 'context_error',
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add history entry for context error: ${historyError}`
+        )
+      }
       return { content: [{ type: 'text', text: message }], isError }
     }
+    // --- End Codebase Context ---
 
-    // --- Git Diff Execution --- (Existing logic)
+    // --- Git Diff Execution --- (Keep as is)
     let gitDiff = ''
     try {
       await logToFile(
@@ -167,237 +220,368 @@ export async function handleReviewChanges(
         }
       }
       gitDiff = combinedDiff
-      // Warn if diff size is within 90% of buffer limit
-      const bufferLimit = GIT_DIFF_MAX_BUFFER_MB * 1024 * 1024
-      if (gitDiff.length > 0.9 * bufferLimit) {
-        await logToFile(
-          `[TaskServer] WARNING: git diff output size (${gitDiff.length} bytes) is within 90% of the buffer limit (${bufferLimit} bytes). Consider increasing GIT_DIFF_MAX_BUFFER_MB if you expect larger diffs.`
-        )
-      }
       if (!gitDiff.trim()) {
-        await logToFile(
-          `[TaskServer] No staged or untracked changes found. (reviewId: ${reviewId})`
-        )
         message = 'No staged or untracked changes found to review.'
+        logToFile(`[TaskServer] ${message} (Review ID: ${reviewId})`)
+        // Wrap history logging
+        try {
+          await addHistoryEntry(featureId, 'tool_response', {
+            tool: 'review_changes',
+            isError: false,
+            message,
+            reviewId,
+            status: 'no_changes',
+          })
+        } catch (historyError) {
+          console.error(
+            `[TaskServer] Failed to add history entry for no_changes status: ${historyError}`
+          )
+        }
         return { content: [{ type: 'text', text: message }] }
       }
-      await logToFile(
-        `[TaskServer] git diff (including untracked) captured (${gitDiff.length} chars). (reviewId: ${reviewId})`
+      logToFile(
+        `[TaskServer] git diff captured (${gitDiff.length} chars). (Review ID: ${reviewId})`
       )
     } catch (error: any) {
-      if (error.message && error.message.includes('not a git repository')) {
-        await logToFile(
-          `[TaskServer] Error: Not a git repository. (reviewId: ${reviewId})`
-        )
-        message = 'Error: The current directory is not a git repository.'
-      } else {
-        await logToFile(
-          `[TaskServer] Error running git diff: ${error} (reviewId: ${reviewId})`
-        )
-        message = 'Error running git diff to get changes.'
-      }
+      message = `Error running git diff: ${error.message || error}` // Assign error message
       isError = true
+      logToFile(`[TaskServer] ${message} (Review ID: ${reviewId})`, error)
+      // Wrap history logging
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'review_changes',
+          isError: true,
+          message,
+          reviewId,
+          step: 'git_diff_error',
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add history entry for git diff error: ${historyError}`
+        )
+      }
       return { content: [{ type: 'text', text: message }], isError }
     }
+    // --- End Git Diff ---
 
-    // --- LLM Review Logic (DRY Refactor) ---
-    async function getStructuredReview({
-      reviewModel,
-      structuredPrompt,
-      fallbackPrompt,
-      schema,
-      reviewId,
-    }: {
-      reviewModel: any
-      structuredPrompt: string
-      fallbackPrompt: string
-      schema: any
-      reviewId: string
-    }) {
-      let message = ''
-      let result
-      let structuredReview: string | null = null
-      let usedFallback = false
-      if ('chat' in reviewModel) {
-        const structuredResult = await aiService.callOpenRouterWithSchema(
-          OPENROUTER_MODEL,
-          [{ role: 'user', content: structuredPrompt }],
-          schema,
-          { temperature: 0.5 }
+    // --- LLM Call to Generate Tasks from Review ---
+    try {
+      logToFile(
+        `[TaskServer] Calling LLM for review analysis and task generation... (Review ID: ${reviewId})`
+      )
+
+      // Fetch history to get original feature request
+      let originalFeatureRequest = 'Original feature request not found.'
+      try {
+        const history = await getHistoryForFeature(featureId, 200) // Fetch more history if needed
+        const planFeatureCall = history.find(
+          (entry) =>
+            entry.role === 'tool_call' &&
+            entry.content?.tool === 'plan_feature' &&
+            entry.content?.params?.feature_description
         )
-        if (structuredResult.success) {
-          const review = structuredResult.data as CodeReview
-          structuredReview = `# Code Review Summary\n${
-            review.summary
-          }\n\n## Issues Found\n${review.issues
-            .map(
-              (issue) =>
-                `\n### ${issue.type.toUpperCase()} (${issue.severity})\n${
-                  issue.description
-                }\n${
-                  issue.location ? `**Location**: ${issue.location}` : ''
-                }\n${
-                  issue.suggestion ? `**Suggestion**: ${issue.suggestion}` : ''
-                }\n`
-            )
-            .join('\n')}\n\n## Recommendations\n${review.recommendations
-            .map((rec) => `- ${rec}`)
-            .join('\n')}\n`
-          result = structuredResult.rawResponse
-          message = structuredReview
-          await logToFile(
-            `[TaskServer] Successfully generated structured code review. (reviewId: ${reviewId})`
+        if (planFeatureCall) {
+          originalFeatureRequest =
+            planFeatureCall.content.params.feature_description
+          logToFile(
+            `[TaskServer] Found original feature request for review context: "${originalFeatureRequest.substring(
+              0,
+              50
+            )}..."`
           )
         } else {
-          usedFallback = true
+          logToFile(
+            `[TaskServer] Could not find original plan_feature call in history for feature ${featureId}.`
+          )
+        }
+      } catch (historyError) {
+        logToFile(
+          `[TaskServer] Error fetching history to get original feature request: ${historyError}. Proceeding without it.`
+        )
+      }
+
+      const contextPromptPart = codebaseContext
+        ? `\n\nCodebase Context Overview:\n\`\`\`\n${codebaseContext}\n\`\`\`\n`
+        : '\n\n(No overall codebase context was available.)'
+
+      // *** REVISED Prompt: Ask for TASKS based on checklist criteria ***
+      const structuredPrompt = `You are a senior software engineer performing a code review.
+Original Feature Request Context: "${originalFeatureRequest}"
+
+Review the following code changes (git diff) and consider the overall codebase context (if provided).
+Your goal is to identify necessary fixes, improvements, or refactorings based on standard best practices and generate a list of actionable coding tasks for another developer to implement.
+
+\`\`\`diff
+${gitDiff}
+\`\`\`
+${contextPromptPart}
+**Review Criteria (Generate tasks based on these):**
+1.  **Functionality:** Does the change work? Are there bugs? Handle edge cases & errors?
+2.  **Design:** Does it fit the architecture? Is it modular/maintainable (SOLID/DRY)? Overly complex?
+3.  **Readability:** Is code clear? Are names good? Are comments needed (explaining 'why')? Style consistent?
+4.  **Maintainability:** Easy to modify/debug/test? Clean dependencies?
+5.  **Performance:** Obvious bottlenecks?
+6.  **Security:** Potential vulnerabilities (input validation, etc.)?
+7.  **Testing:** Are tests needed/adequate (if context allows)?
+
+**Output Format:**
+Respond ONLY with a single valid JSON object matching this exact schema:
+{
+  "tasks": [
+    {
+      "description": "string // Clear, concise description of the required coding action.",
+      "effort": "'low' | 'medium' | 'high' // Estimated effort level."
+    }
+    // ... include all actionable tasks generated from the review.
+    // If NO tasks are needed, return an empty array: "tasks": []
+  ]
+}
+
+Do NOT include summaries, commentary, or anything outside this JSON structure. Do not use markdown formatting.`
+
+      let llmResponseData: { tasks: Task[] } | null = null
+      let rawLLMResponse: any = null
+
+      // Call LLM using aiService - Attempt structured output
+      if ('chat' in reviewModel) {
+        // OpenRouter
+        const structuredResult = await aiService.callOpenRouterWithSchema(
+          process.env.OPENROUTER_MODEL || 'google/gemini-flash-1.5:free', // Use configured or default for review
+          [{ role: 'user', content: structuredPrompt }],
+          PlanFeatureResponseSchema, // Use the task list schema
+          { temperature: 0.5 } // Slightly higher temp might be ok for task generation
+        )
+        rawLLMResponse = structuredResult.rawResponse
+
+        if (structuredResult.success) {
+          llmResponseData = structuredResult.data as { tasks: Task[] }
+          // Wrap history logging
+          try {
+            await addHistoryEntry(featureId, 'model', {
+              tool: 'review_changes',
+              reviewId,
+              response: llmResponseData,
+              structured: true,
+            })
+          } catch (historyError) {
+            console.error(
+              `[TaskServer] Failed to add history entry for successful structured OpenRouter response: ${historyError}`
+            )
+          }
+        } else {
+          logToFile(
+            `[TaskServer] Structured review task generation failed (OpenRouter): ${structuredResult.error}. Cannot reliably generate tasks from review.`
+          )
+          message = `Error: AI failed to generate structured tasks based on review: ${structuredResult.error}`
+          isError = true
+          // Wrap history logging
+          try {
+            await addHistoryEntry(featureId, 'tool_response', {
+              tool: 'review_changes',
+              isError,
+              message,
+              reviewId,
+              step: 'llm_structured_fail',
+            })
+          } catch (historyError) {
+            console.error(
+              `[TaskServer] Failed to add history entry for OpenRouter structured fail: ${historyError}`
+            )
+          }
+          return { content: [{ type: 'text', text: message }], isError }
         }
       } else {
+        // Gemini
         const structuredResult = await aiService.callGeminiWithSchema(
-          GEMINI_MODEL,
+          process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest',
           structuredPrompt,
-          schema,
+          PlanFeatureResponseSchema, // Use the task list schema
           { temperature: 0.5 }
         )
+        rawLLMResponse = structuredResult.rawResponse
+
         if (structuredResult.success) {
-          const review = structuredResult.data as CodeReview
-          structuredReview = `# Code Review Summary\n${
-            review.summary
-          }\n\n## Issues Found\n${review.issues
-            .map(
-              (issue) =>
-                `\n### ${issue.type.toUpperCase()} (${issue.severity})\n${
-                  issue.description
-                }\n${
-                  issue.location ? `**Location**: ${issue.location}` : ''
-                }\n${
-                  issue.suggestion ? `**Suggestion**: ${issue.suggestion}` : ''
-                }\n`
+          llmResponseData = structuredResult.data as { tasks: Task[] }
+          // Wrap history logging
+          try {
+            await addHistoryEntry(featureId, 'model', {
+              tool: 'review_changes',
+              reviewId,
+              response: llmResponseData,
+              structured: true,
+            })
+          } catch (historyError) {
+            console.error(
+              `[TaskServer] Failed to add history entry for successful structured Gemini response: ${historyError}`
             )
-            .join('\n')}\n\n## Recommendations\n${review.recommendations
-            .map((rec) => `- ${rec}`)
-            .join('\n')}\n`
-          result = structuredResult.rawResponse
-          message = structuredReview
-          await logToFile(
-            `[TaskServer] Successfully generated structured code review. (reviewId: ${reviewId})`
+          }
+        } else {
+          logToFile(
+            `[TaskServer] Structured review task generation failed (Gemini): ${structuredResult.error}. Cannot reliably generate tasks from review.`
           )
-        } else {
-          usedFallback = true
+          message = `Error: AI failed to generate structured tasks based on review: ${structuredResult.error}`
+          isError = true
+          // Wrap history logging
+          try {
+            await addHistoryEntry(featureId, 'tool_response', {
+              tool: 'review_changes',
+              isError,
+              message,
+              reviewId,
+              step: 'llm_structured_fail',
+            })
+          } catch (historyError) {
+            console.error(
+              `[TaskServer] Failed to add history entry for Gemini structured fail: ${historyError}`
+            )
+          }
+          return { content: [{ type: 'text', text: message }], isError }
         }
       }
-      if (usedFallback) {
-        await logToFile(
-          `[TaskServer] Structured code review failed. Falling back to unstructured format. (reviewId: ${reviewId})`
-        )
-        if ('chat' in reviewModel) {
-          result = await reviewModel.chat.completions.create({
-            model: OPENROUTER_MODEL,
-            messages: [{ role: 'user', content: fallbackPrompt }],
-            temperature: 0.5,
+
+      // --- Process and Save Generated Tasks ---
+      if (!llmResponseData || !llmResponseData.tasks) {
+        message = 'Error: LLM response did not contain a valid task list.'
+        isError = true
+        logToFile(`[TaskServer] ${message} (Review ID: ${reviewId})`)
+        // Wrap history logging
+        try {
+          await addHistoryEntry(featureId, 'tool_response', {
+            tool: 'review_changes',
+            isError,
+            message,
+            reviewId,
+            step: 'task_processing_error',
           })
-          message =
-            aiService.extractTextFromResponse(result) ||
-            'Error: Failed to get review response.'
-        } else {
-          result = await reviewModel.generateContent({
-            contents: [{ role: 'user', parts: [{ text: fallbackPrompt }] }],
-            generationConfig: {
-              temperature: 0.5,
-            },
-          })
-          message =
-            aiService.extractTextFromResponse(result) ||
-            'Error: Failed to get review response.'
+        } catch (historyError) {
+          console.error(
+            `[TaskServer] Failed to add history entry for task processing error: ${historyError}`
+          )
         }
+        return { content: [{ type: 'text', text: message }], isError }
       }
-      return message
-    }
 
-    try {
-      await logToFile(
-        `[TaskServer] Calling LLM for review analysis... (reviewId: ${reviewId})`,
-        'info'
-      )
-
-      // Prepare context part for prompt
-      const contextPromptPart = codebaseContext
-        ? `\n\nAdditionally, consider this overview of the codebase structure:\n\`\`\`\n${codebaseContext}\n\`\`\`\n`
-        : '\n\n(No overall codebase context was available for this review.)'
-
-      // Update prompts to include codebase context
-      const structuredPrompt = `You are a senior software engineer performing a code review. Review the following code changes (git diff):\n\n\u007f\u007f\u007f\ndiff\n${gitDiff}\n\u007f\u007f\u007f\n${contextPromptPart}\n\nBased on your review of the changes *and* the overall codebase context (if provided), generate a list of actionable coding tasks that a developer should perform to address any issues, improvements, or refactoring opportunities you find.\n\nFor each task, provide:\n- A clear, concise description of the coding action required.\n- An estimated effort level: 'low', 'medium', or 'high'.\n\nIf there are no actionable coding tasks required, respond with an empty tasks array.\n\nRespond ONLY with a single valid JSON object matching this exact schema:\n{\n  "tasks": [\n    { "description": "Task description here", "effort": "low" | "medium" | "high" },\n    ...\n  ]\n}\n\nDo NOT include any summary, issues, recommendations, or any text outside the JSON object. Do not use markdown formatting.`
-
-      const fallbackPrompt = `Review the following code changes (git diff):\n\u007f\u007f\u007f\ndiff\n${gitDiff}\n\u007f\u007f\u007f\n${contextPromptPart}\n\nList the coding tasks needed to address any issues or improvements based on the changes and context. For each, provide a description and an effort rating (low, medium, high). Respond with a JSON object: { "tasks": [ { "description": "...", "effort": "low" }, ... ] }.`
-
-      message = await getStructuredReview({
-        reviewModel,
-        structuredPrompt,
-        fallbackPrompt,
-        schema: ReviewResponseWithTasksSchema,
-        reviewId,
-      })
-      if (!message) {
+      if (llmResponseData.tasks.length === 0) {
         message =
-          'Error: Failed to get review response from LLM or response was blocked. AI Agent: Do not try to call again. Simply alert the user.'
-        isError = true
-        return { content: [{ type: 'text', text: message }], isError }
+          'Code review completed. No immediate action tasks were identified.'
+        logToFile(`[TaskServer] ${message} (Review ID: ${reviewId})`)
+        // Wrap history logging
+        try {
+          await addHistoryEntry(featureId, 'tool_response', {
+            tool: 'review_changes',
+            isError: false,
+            message,
+            reviewId,
+            status: 'no_tasks_generated',
+          })
+        } catch (historyError) {
+          console.error(
+            `[TaskServer] Failed to add history entry for no_tasks_generated status: ${historyError}`
+          )
+        }
+        return { content: [{ type: 'text', text: message }], isError: false }
       }
-      // Validate the response against the ReviewResponseWithTasksSchema
-      const validation = parseAndValidateJsonResponse(
-        message,
-        ReviewResponseWithTasksSchema
+
+      // Format tasks for processing (like in planFeature)
+      const rawPlanSteps = llmResponseData.tasks.map(
+        (task) => `[${task.effort}] ${task.description}`
       )
-      if (!validation.success) {
-        const snippet =
-          message.length > 300 ? message.slice(0, 300) + '...' : message
-        message = `Error: LLM response did not match expected schema. ${validation.error}\nResponse snippet: ${snippet}`
-        isError = true
-        return { content: [{ type: 'text', text: message }], isError }
-      }
-      // Extract raw task descriptions in the format expected by processAndFinalizePlan
-      const rawPlanSteps = validation.data.tasks.map(
-        (task: { description: string; effort: string }) =>
-          `[${task.effort}] ${task.description}`
+
+      logToFile(
+        `[TaskServer] Generated ${rawPlanSteps.length} tasks from review. Processing... (Review ID: ${reviewId})`
       )
-      // Use the review model for effort estimation/breakdown
+
+      // Process these tasks (effort check, breakdown, save, notify)
+      // This adds the review-generated tasks to the existing feature plan
       const finalTasks = await processAndFinalizePlan(
         rawPlanSteps,
-        reviewModel,
+        reviewModel, // Use the same model for potential breakdown
         featureId,
-        true // fromReview
+        true // Indicate tasks came from review context
       )
-      const taskCount = finalTasks.length
-      let firstTaskDesc = finalTasks[0]?.description
-      const responseData = {
-        status: 'completed',
-        message: `Successfully created ${taskCount} tasks from code review.${
-          firstTaskDesc ? ' First task: "' + firstTaskDesc + '"' : ''
-        } To start implementation, call 'get_next_task' with featureId '${featureId}'.`,
+
+      const taskCount = finalTasks.length // Count tasks *added* or processed
+      const firstNewTask = finalTasks[0] // Get the first task generated by *this* review
+
+      const responseData: PlanFeatureStandardResponse = {
+        status: 'completed', // Indicates review+task generation is done
+        // Provide a clear message indicating tasks were *added* from review
+        message: `Code review complete. Generated ${taskCount} actionable tasks based on the review. ${
+          firstNewTask
+            ? 'First new task: "' + firstNewTask.description + '"'
+            : ''
+        } Call 'get_next_task' with featureId '${featureId}' to continue implementation.`,
         featureId: featureId,
+        taskCount: taskCount,
+        firstTask: firstNewTask
+          ? {
+              description: firstNewTask.description || '',
+              effort: firstNewTask.effort || 'medium',
+            }
+          : undefined, // Ensure effort is present
       }
-      await logToFile(`[TaskServer] ${responseData.message}`)
+
+      logToFile(
+        `[TaskServer] Review tasks processed and saved for feature ${featureId}. (Review ID: ${reviewId})`
+      )
+      // Wrap history logging
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'review_changes',
+          isError: false,
+          message: responseData.message,
+          reviewId,
+          responseData,
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add final success history entry: ${historyError}`
+        )
+      }
+
+      // Return the standardized response object, serialized
       return {
         content: [{ type: 'text', text: JSON.stringify(responseData) }],
         isError: false,
       }
-    } catch (error) {
-      console.error(
-        `[TaskServer] Error calling LLM review API (reviewId: ${reviewId}):`,
+    } catch (error: any) {
+      message = `Error occurred during review analysis API call: ${error.message}`
+      isError = true
+      logToFile(
+        `[TaskServer] Error calling LLM review API (Review ID: ${reviewId})`,
         error
       )
-      message = 'Error occurred during review analysis API call.'
-      isError = true
+      // Wrap history logging inside the catch block
+      try {
+        await addHistoryEntry(featureId, 'tool_response', {
+          tool: 'review_changes',
+          isError,
+          message,
+          error: error.message,
+          reviewId,
+        })
+      } catch (historyError) {
+        console.error(
+          `[TaskServer] Failed to add error history entry during LLM API call failure: ${historyError}`
+        )
+      }
       return { content: [{ type: 'text', text: message }], isError }
     }
-  } catch (error) {
-    const errorMsg = `Error processing review_changes request: ${
-      error instanceof Error ? error.message : String(error)
-    }`
-    console.error(`[TaskServer] ${errorMsg}`)
-
-    return {
-      content: [{ type: 'text', text: errorMsg }],
-      isError: true,
+  } catch (error: any) {
+    // Outer catch already wraps history logging and ignores errors
+    const errorMsg = `Error processing review_changes request: ${error.message}`
+    logToFile(`[TaskServer] ${errorMsg} (Review ID: ${reviewId})`, error)
+    try {
+      await addHistoryEntry(featureId, 'tool_response', {
+        tool: 'review_changes',
+        isError: true,
+        message: errorMsg,
+        reviewId,
+        step: 'preprocessing_error',
+      })
+    } catch (historyError) {
+      /* Ignore */
     }
+    return { content: [{ type: 'text', text: errorMsg }], isError: true }
   }
 }

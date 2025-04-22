@@ -176,7 +176,7 @@ export async function adjustPlanHandler(
 
         if (clarificationCheck.detected) {
           // Store the intermediate state
-          const questionId = planningStateService.storeIntermediateState(
+          const questionId = await planningStateService.storeIntermediateState(
             featureId,
             prompt,
             clarificationCheck.rawResponse,
@@ -243,11 +243,18 @@ export async function adjustPlanHandler(
       featureId: featureId,
       payload: { code: 'PLAN_ADJUST_FAILED', message: error.message },
     })
-    await addHistoryEntry(featureId, 'tool_response', {
-      tool: 'adjust_plan',
-      status: 'failed',
-      error: error.message,
-    })
+    // Add history entry, but handle potential errors during logging itself
+    try {
+      await addHistoryEntry(featureId, 'tool_response', {
+        tool: 'adjust_plan',
+        status: 'failed',
+        error: error.message,
+      })
+    } catch (historyError) {
+      console.error(
+        `[TaskServer] Failed to add error history entry during adjustPlan failure: ${historyError}`
+      )
+    }
     return {
       status: 'error',
       message: `Error adjusting plan: ${error.message}`,

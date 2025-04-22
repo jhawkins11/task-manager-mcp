@@ -38,6 +38,10 @@ const GIT_DIFF_MAX_BUFFER_MB = parseInt(
   10
 )
 
+// Add config for auto-review on completion
+const AUTO_REVIEW_ON_COMPLETION =
+  process.env.AUTO_REVIEW_ON_COMPLETION === 'true'
+
 // Define safety settings for content generation
 import { HarmCategory, HarmBlockThreshold } from '@google/generative-ai'
 const safetySettings = [
@@ -76,4 +80,5 @@ export {
   WS_HOST,
   UI_PORT,
   GIT_DIFF_MAX_BUFFER_MB,
+  AUTO_REVIEW_ON_COMPLETION,
 }

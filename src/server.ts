@@ -636,7 +636,9 @@ async function main() {
         ;(async () => {
           const { featureId } = req.params
           try {
-            const state = planningStateService.getStateByFeatureId(featureId)
+            const state = await planningStateService.getStateByFeatureId(
+              featureId
+            )
             if (state && state.partialResponse) {
               // Attempt to parse the stored partialResponse as JSON
               let parsedData: any

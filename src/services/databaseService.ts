@@ -92,7 +92,11 @@ class DatabaseService {
     }
 
     try {
+      // Run schema first to create tables if they don't exist
       await this.runSchemaFromFile()
+
+      // Run migrations to update existing tables
+      await this.runMigrationsFromFile()
     } catch (error) {
       console.error('Error running migrations:', error)
       throw error
@@ -114,6 +118,39 @@ class DatabaseService {
 
     for (const statement of statements) {
       await this.run(`${statement};`)
+    }
+  }
+
+  private async runMigrationsFromFile(): Promise<void> {
+    const migrationsPath = path.join(
+      process.cwd(),
+      'src',
+      'config',
+      'migrations.sql'
+    )
+
+    if (!fs.existsSync(migrationsPath)) {
+      console.log(
+        `Migrations file not found at ${migrationsPath}, skipping migrations`
+      )
+      return
+    }
+
+    const migrations = fs.readFileSync(migrationsPath, 'utf8')
+    const statements = migrations
+      .split(';')
+      .map((statement) => statement.trim())
+      .filter((statement) => statement.length > 0)
+
+    for (const statement of statements) {
+      try {
+        await this.run(`${statement};`)
+      } catch (error) {
+        // Some migrations might fail if the column already exists, which is expected
+        console.log(
+          `Migration statement failed, likely already applied: ${statement}`
+        )
+      }
     }
   }
 
@@ -205,7 +242,7 @@ class DatabaseService {
         `SELECT 
           id, title, description, status, 
           completed, effort, feature_id, parent_task_id,
-          created_at, updated_at
+          created_at, updated_at, from_review
         FROM tasks 
         WHERE feature_id = ?
         ORDER BY created_at ASC`,
@@ -215,6 +252,7 @@ class DatabaseService {
       return rows.map((row) => ({
         ...row,
         completed: Boolean(row.completed),
+        fromReview: Boolean(row.from_review),
       }))
     } catch (error) {
       console.error(`Error fetching tasks for feature ${featureId}:`, error)
@@ -232,7 +270,7 @@ class DatabaseService {
         `SELECT 
           id, title, description, status, 
           completed, effort, feature_id, parent_task_id,
-          created_at, updated_at
+          created_at, updated_at, from_review
         FROM tasks 
         WHERE id = ?`,
         [taskId]
@@ -245,6 +283,7 @@ class DatabaseService {
       return {
         ...row,
         completed: Boolean(row.completed),
+        fromReview: Boolean(row.from_review),
       }
     } catch (error) {
       console.error(`Error fetching task ${taskId}:`, error)
@@ -265,8 +304,8 @@ class DatabaseService {
         `INSERT INTO tasks (
           id, title, description, status, 
           completed, effort, feature_id, parent_task_id,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          created_at, updated_at, from_review
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           task.id,
           task.title || null,
@@ -278,6 +317,7 @@ class DatabaseService {
           task.parent_task_id || null,
           timestamp,
           task.updated_at || timestamp,
+          task.fromReview ? 1 : 0,
         ]
       )
 
@@ -348,12 +388,16 @@ class DatabaseService {
         description: updates.description ?? task.description,
         effort: updates.effort ?? task.effort,
         parent_task_id: updates.parent_task_id ?? task.parent_task_id,
+        fromReview:
+          updates.fromReview !== undefined
+            ? updates.fromReview
+            : task.fromReview,
         updated_at: now,
       }
 
       const result = await this.run(
         `UPDATE tasks 
-         SET title = ?, description = ?, effort = ?, parent_task_id = ?, updated_at = ? 
+         SET title = ?, description = ?, effort = ?, parent_task_id = ?, updated_at = ?, from_review = ? 
          WHERE id = ?`,
         [
           updatedTask.title || null,
@@ -361,6 +405,7 @@ class DatabaseService {
           updatedTask.effort || null,
           updatedTask.parent_task_id || null,
           updatedTask.updated_at,
+          updatedTask.fromReview ? 1 : 0,
           taskId,
         ]
       )

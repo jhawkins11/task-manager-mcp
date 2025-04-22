@@ -631,185 +631,223 @@ export async function processAndFinalizePlan(
   rawPlanSteps: string[],
   model: GenerativeModel | OpenAI | null,
   featureId: string,
-  fromReview?: boolean
+  fromReview: boolean = false // Add default value
 ): Promise<Task[]> {
-  await logToFile(
-    `[processAndFinalizePlan] Starting for feature ${featureId} with ${rawPlanSteps.length} raw steps.`
+  logToFile(
+    `[TaskServer] Processing and finalizing plan for feature ${featureId}...`
   )
+  let existingTasks: Task[] = []
+  let finalTasks: Task[] = []
+  const complexTaskMap = new Map<string, string>() // To track original description of broken down tasks
+
   try {
-    // 1. Ensure effort ratings
-    await logToFile(`[processAndFinalizePlan] Ensuring effort ratings...`)
-    const effortRatedSteps = await ensureEffortRatings(rawPlanSteps, model)
-    await logToFile(`[processAndFinalizePlan] Effort ratings ensured.`)
-
-    // 2. Process and breakdown tasks
-    await logToFile(
-      `[processAndFinalizePlan] Processing and breaking down tasks...`
-    )
-    const { finalTasks } = await processAndBreakdownTasks(
-      effortRatedSteps,
-      model,
-      featureId
-    )
-    await logToFile(
-      `[processAndFinalizePlan] Breakdown complete. ${finalTasks.length} final tasks generated.`
+    // 1. Ensure all raw steps have effort ratings
+    const initialTasksWithEffort = await ensureEffortRatings(
+      rawPlanSteps,
+      model
     )
 
-    // 3. Save the tasks to the database
-    await logToFile(`[processAndFinalizePlan] Connecting to database...`)
+    // 2. Process tasks: Breakdown high-effort ones
+    const { finalTasks: processedTasks, complexTaskMap: breakdownMap } =
+      await processAndBreakdownTasks(
+        initialTasksWithEffort,
+        model,
+        featureId // Pass featureId for logging/history
+      )
+
+    // Merge complexTaskMap from breakdown
+    breakdownMap.forEach((value, key) => complexTaskMap.set(key, value))
+
+    // --- Start Database Operations ---
     await databaseService.connect()
-    await logToFile(
+    logToFile(
       `[processAndFinalizePlan] Database connected. Fetching existing tasks...`
     )
 
-    // First, get existing tasks to handle updates/deletions
-    const existingTasks = await databaseService.getTasksByFeatureId(featureId)
-    await logToFile(
-      `[processAndFinalizePlan] Found ${existingTasks.length} existing tasks for feature ${featureId}.`
-    )
-    const existingTasksMap = new Map(
-      existingTasks.map((task) => [task.id, task])
-    )
+    // 3. Fetch existing tasks to compare
+    existingTasks = await databaseService.getTasksByFeatureId(featureId)
 
-    // Process each final task
-    await logToFile(
-      `[processAndFinalizePlan] Processing ${finalTasks.length} final tasks...`
-    )
-    for (const task of finalTasks) {
-      await logToFile(`[processAndFinalizePlan] Processing task ID: ${task.id}`)
-      const now = Math.floor(Date.now() / 1000)
-      let taskCreatedAt: number
-      let taskUpdatedAt: number
-      try {
-        // Helper function to convert timestamp
-        const convertTimestamp = (ts: string | number | undefined): number => {
-          if (typeof ts === 'number') return ts // Already a number
-          if (typeof ts === 'string') {
-            // Check if it's a numeric string (potential epoch seconds)
-            const numericVal = Number(ts)
-            if (!isNaN(numericVal) && isFinite(numericVal)) {
-              // Assume it's epoch seconds if it looks like one (e.g., 10 digits)
-              // More robust checks could be added (e.g., range check)
-              if (String(numericVal).length >= 10) {
-                return Math.floor(numericVal)
-              }
-            }
-            // Otherwise, assume it's an ISO date string
-            const dateVal = new Date(ts)
-            if (!isNaN(dateVal.getTime())) {
-              // Check if Date parsing was successful
-              return Math.floor(dateVal.getTime() / 1000)
-            }
+    const existingTaskMap = new Map(existingTasks.map((t) => [t.id, t]))
+    const processedTaskMap = new Map(processedTasks.map((t) => [t.id, t]))
+    const tasksToAdd: Task[] = []
+    const tasksToUpdate: { id: string; updates: Partial<Task> }[] = []
+    const taskIdsToDelete: string[] = []
+
+    // 4. Compare processed tasks with existing tasks
+    for (const processedTask of processedTasks) {
+      if (existingTaskMap.has(processedTask.id)) {
+        // Task exists, check for updates
+        const existing = existingTaskMap.get(processedTask.id)!
+        // updates object should only contain keys matching DB columns (snake_case)
+        const updates: Partial<
+          Pick<Task, 'description' | 'effort' | 'fromReview'> & {
+            parentTaskId?: string
           }
-          return now // Default to current time if conversion fails
+        > = {}
+        if (existing.description !== processedTask.description) {
+          updates.description = processedTask.description
+        }
+        if (existing.effort !== processedTask.effort) {
+          updates.effort = processedTask.effort
+        }
+        // Compare snake_case from DB (existing) with camelCase from processed Task
+        if (existing.parentTaskId !== processedTask.parentTaskId) {
+          // Add snake_case key to updates object for DB
+          updates.parentTaskId = processedTask.parentTaskId
+        }
+        // Always update the 'fromReview' flag if this process is from review
+        if (fromReview && !existing.fromReview) {
+          // Use camelCase here as Task type expects it, DB service handles conversion to snake_case
+          updates.fromReview = true
         }
 
-        taskCreatedAt = convertTimestamp(task.createdAt)
-        taskUpdatedAt = convertTimestamp(task.updatedAt)
-      } catch (tsError: any) {
-        await logToFile(
-          `[processAndFinalizePlan] Error converting timestamp for task ${task.id}: ${tsError.message}`
-        )
-        // Assign default timestamp on error to avoid crashing
-        taskCreatedAt = now
-        taskUpdatedAt = now
-      }
-
-      const taskWithTimestamps = {
-        ...task,
-        fromReview: fromReview ? true : task.fromReview,
-        created_at: taskCreatedAt,
-        updated_at: taskUpdatedAt,
-        parent_task_id: task.parentTaskId,
-        feature_id: featureId,
-      }
-
-      // Check if this task already exists (by ID)
-      if (existingTasksMap.has(task.id)) {
-        await logToFile(
-          `[processAndFinalizePlan] Updating existing task ID: ${task.id}`
-        )
-        const existingTask = existingTasksMap.get(task.id)!
-
-        // Determine the correct fromReview status: preserve existing if true, otherwise use the parameter
-        const finalFromReview =
-          existingTask.fromReview || (fromReview ? true : false)
-
-        // It's an update to an existing task
-        if (task.status !== existingTask.status) {
-          await logToFile(
-            `[processAndFinalizePlan] Updating status for task ${task.id} from ${existingTask.status} to ${task.status}`
-          )
-          await databaseService.updateTaskStatus(
-            task.id,
-            task.status,
-            task.completed
-          )
+        // Check if any updates are needed using the keys in the updates object
+        if (Object.keys(updates).length > 0) {
+          tasksToUpdate.push({ id: processedTask.id, updates })
         }
-
-        // Update other details, including the potentially preserved fromReview status
-        await logToFile(
-          `[processAndFinalizePlan] Updating details for task ${task.id}`
-        )
-        await databaseService.updateTaskDetails(task.id, {
-          title: task.title,
-          description: task.description,
-          effort: task.effort,
-          parent_task_id: task.parentTaskId,
-          fromReview: finalFromReview, // Pass the determined status
-        })
-
-        // Remove from the map to track what's been processed
-        existingTasksMap.delete(task.id)
       } else {
-        await logToFile(
-          `[processAndFinalizePlan] Adding new task ID: ${task.id}`
-        )
-        // It's a new task, add it
-        await databaseService.addTask(taskWithTimestamps)
+        // New task to add
+        tasksToAdd.push(processedTask)
       }
-      await logToFile(
-        `[processAndFinalizePlan] Finished processing task ID: ${task.id}`
-      )
     }
 
-    // Any tasks still in existingTasksMap should be deleted as they weren't in finalTasks
-    if (existingTasksMap.size > 0) {
-      await logToFile(
-        `[processAndFinalizePlan] Deleting ${existingTasksMap.size} tasks not present in the final plan...`
-      )
-      for (const taskId of existingTasksMap.keys()) {
-        await logToFile(`[processAndFinalizePlan] Deleting task ID: ${taskId}`)
-        await databaseService.deleteTask(taskId)
+    // Identify tasks to delete (exist in DB but not in new plan)
+    for (const existingTask of existingTasks) {
+      if (!processedTaskMap.has(existingTask.id)) {
+        taskIdsToDelete.push(existingTask.id)
       }
-      await logToFile(`[processAndFinalizePlan] Finished deleting tasks.`)
     }
 
-    await logToFile(`[processAndFinalizePlan] Closing database connection...`)
-    await databaseService.close()
-    await logToFile(`[processAndFinalizePlan] Database connection closed.`)
+    // 5. Apply changes to the database
+    logToFile(
+      `[processAndFinalizePlan] Applying DB changes: ${tasksToAdd.length} adds, ${tasksToUpdate.length} updates, ${taskIdsToDelete.length} deletes.`
+    )
+    for (const { id, updates } of tasksToUpdate) {
+      // Check if the task being updated was decomposed
+      const isDecomposed = complexTaskMap.has(id)
+      if (isDecomposed) {
+        // If decomposed, mark status as 'decomposed' and completed = true
+        await databaseService.updateTaskStatus(id, 'decomposed', true)
+        // Only update other details if necessary (rare for decomposed tasks)
+        if (Object.keys(updates).length > 0) {
+          // Pass updates object (contains snake_case key) to DB service
+          await databaseService.updateTaskDetails(id, updates)
+        }
+      } else {
+        // Otherwise, just update details
+        // Pass updates object (contains snake_case key) to DB service
+        await databaseService.updateTaskDetails(id, updates)
+      }
+    }
 
-    // 4. Notify clients that tasks have been updated
-    await logToFile(`[processAndFinalizePlan] Notifying WebSocket clients...`)
-    webSocketService.notifyTasksUpdated(featureId, finalTasks)
-    await logToFile(`[processAndFinalizePlan] WebSocket clients notified.`)
+    for (const task of tasksToAdd) {
+      // Ensure parent task exists if specified using camelCase from Task type
+      if (task.parentTaskId) {
+        const parentExistsInDB = existingTaskMap.has(task.parentTaskId)
+        const parentExistsInProcessed = processedTaskMap.has(task.parentTaskId)
+
+        if (!parentExistsInDB && !parentExistsInProcessed) {
+          logToFile(
+            `[processAndFinalizePlan] Warning: Parent task ${task.parentTaskId} for task ${task.id} not found. Setting parent to null.`
+          )
+          // Use camelCase when modifying the task object
+          task.parentTaskId = undefined
+        }
+      }
+
+      // Prepare object for DB insertion with snake_case keys
+      const now = Math.floor(Date.now() / 1000)
+      const dbTaskPayload: any = {
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+        completed: task.completed ? 1 : 0,
+        effort: task.effort,
+        feature_id: featureId,
+        created_at:
+          task.createdAt && typeof task.createdAt === 'number'
+            ? Math.floor(new Date(task.createdAt * 1000).getTime() / 1000)
+            : now, // Map and convert
+        updated_at:
+          task.updatedAt && typeof task.updatedAt === 'number'
+            ? Math.floor(new Date(task.updatedAt * 1000).getTime() / 1000)
+            : now, // Map and convert
+        from_review: fromReview || task.fromReview ? 1 : 0, // Convert camelCase to snake_case for DB
+      }
+
+      // Only add parent_task_id if it exists and is not null
+      if (task.parentTaskId !== null && task.parentTaskId !== undefined) {
+        dbTaskPayload.parent_task_id = task.parentTaskId
+      }
+
+      await databaseService.addTask(dbTaskPayload)
+    }
+
+    for (const taskId of taskIdsToDelete) {
+      await databaseService.deleteTask(taskId)
+    }
+
+    // 6. Fetch the final list of tasks after all modifications
+    finalTasks = await databaseService.getTasksByFeatureId(featureId)
 
     logToFile(
-      `[processAndFinalizePlan] Successfully processed ${finalTasks.length} final tasks for feature ${featureId}`
+      `[processAndFinalizePlan] Final task count for feature ${featureId}: ${finalTasks.length}`
     )
-
-    return finalTasks
-  } catch (error: any) {
-    // Improved error logging
-    await logToFile(
-      `[processAndFinalizePlan] Error processing plan for feature ${featureId}. Error: ${JSON.stringify(
-        error,
-        Object.getOwnPropertyNames(error)
-      )}`
+    // --- End Database Operations ---
+  } catch (error) {
+    logToFile(
+      `[processAndFinalizePlan] Error during plan finalization for feature ${featureId}: ${error}`
     )
-    // Re-throw the error to be handled by the specific caller context
+    console.error(`[TaskServer] Error during plan finalization:`, error)
+    // Re-throw the error to be handled by the caller (e.g., tool handler)
     throw error
+  } finally {
+    // Ensure database connection is closed, even if errors occurred
+    try {
+      await databaseService.close()
+      logToFile(`[processAndFinalizePlan] Database connection closed.`)
+    } catch (closeError) {
+      logToFile(
+        `[processAndFinalizePlan] Error closing database connection: ${closeError}`
+      )
+      console.error(`[TaskServer] Error closing database:`, closeError)
+    }
   }
+
+  // 7. Notify UI about the updated tasks (outside the main try/catch for DB ops)
+  try {
+    const formattedTasks = finalTasks.map((task) => ({
+      // Basic formatting for WS
+      id: task.id,
+      description: task.description,
+      status: task.status,
+      effort: task.effort,
+      // Map snake_case from DB task to camelCase for WebSocket payload
+      parentTaskId: task.parentTaskId,
+      completed: task.completed, // DB Service already converts this to boolean
+      title: task.title,
+      // Map snake_case timestamps from DB to ISO strings for WebSocket payload
+      createdAt:
+        task.createdAt && typeof task.createdAt === 'number'
+          ? new Date(task.createdAt * 1000).toISOString()
+          : undefined,
+      updatedAt:
+        task.updatedAt && typeof task.updatedAt === 'number'
+          ? new Date(task.updatedAt * 1000).toISOString()
+          : undefined,
+    }))
+    webSocketService.notifyTasksUpdated(featureId, formattedTasks)
+    logToFile(`[processAndFinalizePlan] WebSocket notification sent.`)
+  } catch (wsError) {
+    logToFile(
+      `[processAndFinalizePlan] Error sending WebSocket notification: ${wsError}`
+    )
+    console.error(`[TaskServer] Error sending WebSocket update:`, wsError)
+    // Do not re-throw WS errors, as the main operation succeeded
+  }
+
+  return finalTasks
 }
 
 /**
