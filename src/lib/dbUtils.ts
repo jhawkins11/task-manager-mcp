@@ -271,7 +271,7 @@ export async function addPlanningState(
 
     await databaseService.connect()
 
-    await databaseService.run(
+    await databaseService.runAsync(
       `INSERT INTO planning_states (
         question_id, feature_id, prompt, partial_response, planning_type, created_at
       ) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -391,7 +391,7 @@ export async function clearPlanningState(questionId: string): Promise<boolean> {
 
     await databaseService.connect()
 
-    const result = await databaseService.run(
+    const result = await databaseService.runAsync(
       `DELETE FROM planning_states WHERE question_id = ?`,
       [questionId]
     )
@@ -422,7 +422,7 @@ export async function clearPlanningStatesForFeature(
 
     await databaseService.connect()
 
-    const result = await databaseService.run(
+    const result = await databaseService.runAsync(
       `DELETE FROM planning_states WHERE feature_id = ?`,
       [featureId]
     )

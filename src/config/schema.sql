@@ -20,7 +20,10 @@ CREATE TABLE IF NOT EXISTS history_entries (
   timestamp INTEGER NOT NULL, -- Unix timestamp
   role TEXT NOT NULL CHECK (role IN ('user', 'model', 'tool_call', 'tool_response')),
   content TEXT NOT NULL,
-  feature_id TEXT NOT NULL
+  feature_id TEXT NOT NULL,
+  task_id TEXT,
+  action TEXT,
+  details TEXT
 );
 
 -- Features Table

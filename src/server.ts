@@ -318,6 +318,21 @@ function formatTaskForFrontend(task: any, featureId: string) {
 
 // --- Server Start ---
 async function main() {
+  logger.info('Entering main function...')
+
+  // Initialize database *before* starting other services
+  try {
+    logger.info('Initializing database...')
+    await databaseService.initializeDatabase()
+    logger.info('Database initialized successfully.')
+  } catch (dbError) {
+    logger.error(
+      'FATAL: Failed to initialize database. Server cannot start.',
+      dbError
+    )
+    process.exit(1) // Exit if database fails to initialize
+  }
+
   await logToFile('[TaskServer] LOG: main() started.')
   logger.info('Main function started')
 

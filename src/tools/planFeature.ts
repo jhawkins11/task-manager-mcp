@@ -52,6 +52,11 @@ interface PlanFeatureStandardResponse {
   featureId: string
   data?: any // For clarification details or potentially first task info
   uiUrl?: string // Include UI URL for convenience
+  firstTask?: {
+    id: string
+    description: string
+    effort: string
+  }
 }
 
 /**
@@ -518,6 +523,8 @@ export async function handlePlanFeature(
 
           // Use traditional Gemini call
           const unstructuredFallbackPrompt = `${contextPromptPart}Generate a detailed, step-by-step coding implementation plan for the feature: "${feature_description}".
+
+          Engineer it in the best way possible, considering all side effects and edge cases. Be extremely thorough and meticulous.
           
           The plan should ONLY include actionable tasks a developer needs to perform within the code. Exclude steps related to project management, deployment, manual testing, documentation updates, or obtaining approvals.
           
@@ -662,33 +669,29 @@ export async function handlePlanFeature(
     }
   } catch (outerError: any) {
     // Catch errors happening before LLM call (e.g., history writing)
-    message = `An unexpected error occurred: ${outerError.message}`
+    message = `[TaskServer] Unexpected error in handlePlanFeature: ${
+      outerError?.message || String(outerError)
+    }`
     isError = true
-    await logToFile(
-      `[TaskServer] Unexpected error in handlePlanFeature: ${outerError.stack}`
-    )
-    // Attempt to record history if possible
+    await logToFile(`${message} Stack: ${outerError?.stack}`, 'error')
+
+    // Record error in history, handling potential logging errors
     try {
       await addHistoryEntry(featureId, 'tool_response', {
         tool: 'plan_feature',
         isError: true,
-        message: outerError.message,
-        step: 'pre_planning_error',
+        message: outerError?.message || String(outerError),
+        step: 'outer_catch_block', // Indicate where the error was caught
+        errorDetails: outerError?.stack, // Include stack trace if available
       })
-    } catch (historyError) {
+    } catch (historyError: any) {
+      // Log the failure to record history, but don't crash the main process
       await logToFile(
-        `[TaskServer] Failed to record history entry for outer error: ${historyError}`
+        `[TaskServer] Failed to record history entry for outer error: ${
+          historyError?.message || String(historyError)
+        }`,
+        'error'
       )
-    }
-    // Ensure even outer errors return the standard structure
-    const errorResponse: PlanFeatureStandardResponse = {
-      status: 'error',
-      message: message,
-      featureId: featureId, // Include featureId if available
-    }
-    return {
-      content: [{ type: 'text', text: JSON.stringify(errorResponse) }],
-      isError: true,
     }
   }
 
@@ -713,9 +716,8 @@ export async function handlePlanFeature(
   let responseData: PlanFeatureStandardResponse
   if (!isError && task_count && task_count > 0) {
     let firstTaskDesc: string | undefined
+    let updatedTasks: Task[] = []
     try {
-      let updatedTasks: Task[] = []
-
       // Use databaseService instead of readTasks
       await databaseService.connect()
       updatedTasks = await databaseService.getTasksByFeatureId(featureId)
@@ -745,6 +747,14 @@ export async function handlePlanFeature(
       }`,
       featureId: featureId,
       uiUrl: uiUrl,
+      firstTask:
+        updatedTasks.length > 0
+          ? {
+              id: updatedTasks[0].id,
+              description: updatedTasks[0].description || '',
+              effort: updatedTasks[0].effort || 'medium',
+            }
+          : undefined,
     }
   } else {
     // Construct error or no-tasks response

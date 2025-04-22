@@ -3,6 +3,7 @@ import fs from 'fs'
 import path from 'path'
 import { promisify } from 'util'
 import { SQLITE_DB_PATH } from '../config'
+import logger from '../lib/winstonLogger'
 
 // Define Task type for database operations
 interface Task {
@@ -46,44 +47,211 @@ class DatabaseService {
 
   constructor(dbPath: string = SQLITE_DB_PATH) {
     this.dbPath = dbPath
-    this.ensureDatabaseDirectory()
+    try {
+      this.ensureDatabaseDirectory()
+    } catch (error: any) {
+      console.error(
+        `[DatabaseService] CRITICAL: Failed to ensure database directory exists at ${path.dirname(
+          this.dbPath
+        )}: ${error.message}`
+      )
+    }
   }
 
   private ensureDatabaseDirectory(): void {
     const dbDir = path.dirname(this.dbPath)
     if (!fs.existsSync(dbDir)) {
+      console.log(`[DatabaseService] Creating database directory: ${dbDir}`)
       fs.mkdirSync(dbDir, { recursive: true })
     }
   }
 
   async connect(): Promise<void> {
+    if (this.db) {
+      logger.debug('[DatabaseService] Already connected.')
+      return Promise.resolve()
+    }
+    logger.debug(`[DatabaseService] Connecting to database at: ${this.dbPath}`)
     return new Promise((resolve, reject) => {
-      this.db = new sqlite3.Database(this.dbPath, (err) => {
+      const verboseDb = new (sqlite3.verbose().Database)(this.dbPath, (err) => {
         if (err) {
-          reject(`Error connecting to SQLite database: ${err.message}`)
+          logger.error(`Error connecting to SQLite database: ${err.message}`, {
+            stack: err.stack,
+          })
+          reject(
+            new Error(`Error connecting to SQLite database: ${err.message}`)
+          )
           return
         }
+        this.db = verboseDb
+        logger.debug('[DatabaseService] Database connection successful.')
         resolve()
       })
     })
   }
 
   async close(): Promise<void> {
+    logger.debug('[DatabaseService] Attempting to close database connection.')
     return new Promise((resolve, reject) => {
       if (!this.db) {
+        logger.debug('[DatabaseService] No active connection to close.')
         resolve()
         return
       }
-
       this.db.close((err) => {
         if (err) {
-          reject(`Error closing SQLite database: ${err.message}`)
+          logger.error(`Error closing SQLite database: ${err.message}`, {
+            stack: err.stack,
+          })
+          reject(new Error(`Error closing SQLite database: ${err.message}`))
           return
         }
         this.db = null
+        logger.debug(
+          '[DatabaseService] Database connection closed successfully.'
+        )
         resolve()
       })
     })
+  }
+
+  public async runAsync(
+    sql: string,
+    params: any[] = []
+  ): Promise<sqlite3.RunResult> {
+    if (!this.db) {
+      logger.error(
+        '[DatabaseService] runAsync called but database is not connected.'
+      )
+      throw new Error('Database is not connected')
+    }
+    return new Promise((resolve, reject) => {
+      this.db!.run(sql, params, function (err) {
+        if (err) {
+          logger.error(
+            `Error executing SQL: ${sql} - Params: ${JSON.stringify(
+              params
+            )} - Error: ${err.message}`,
+            { stack: err.stack }
+          )
+          reject(new Error(`Error executing SQL: ${err.message}`))
+        } else {
+          resolve(this)
+        }
+      })
+    })
+  }
+
+  private async runSchemaFromFile(): Promise<void> {
+    const schemaPath = path.join(__dirname, '..', 'config', 'schema.sql')
+    logger.info(`Attempting to run schema from: ${schemaPath}`)
+    if (!fs.existsSync(schemaPath)) {
+      logger.error(`Schema file not found at ${schemaPath}`)
+      throw new Error(`Schema file not found at ${schemaPath}`)
+    }
+    logger.info(`Schema file found at ${schemaPath}`)
+    const schema = fs.readFileSync(schemaPath, 'utf8')
+    const statements = schema
+      .split(';')
+      .map((statement) => statement.trim())
+      .filter((statement) => statement.length > 0)
+    logger.info(`Found ${statements.length} SQL statements in schema file.`)
+    if (!this.db) {
+      logger.error('Database is not connected in runSchemaFromFile.')
+      throw new Error('Database is not connected')
+    }
+    try {
+      logger.info('Starting transaction for schema execution.')
+      await this.runAsync('BEGIN TRANSACTION;')
+      for (let i = 0; i < statements.length; i++) {
+        const statement = statements[i]
+        logger.debug(
+          `Executing schema statement #${i + 1}: ${statement.substring(
+            0,
+            60
+          )}...`
+        )
+        await this.runAsync(statement)
+        logger.debug(`Successfully executed statement #${i + 1}`)
+      }
+      logger.info('Committing transaction for schema execution.')
+      await this.runAsync('COMMIT;')
+      logger.info('Schema execution committed successfully.')
+    } catch (error: any) {
+      logger.error(
+        `Error during schema execution: ${error.message}. Rolling back transaction.`,
+        { stack: error.stack }
+      )
+      try {
+        await this.runAsync('ROLLBACK;')
+        logger.info('Transaction rolled back successfully.')
+      } catch (rollbackError: any) {
+        logger.error(`Failed to rollback transaction: ${rollbackError.message}`)
+      }
+      throw new Error(`Schema execution failed: ${error.message}`)
+    }
+  }
+
+  async tableExists(tableName: string): Promise<boolean> {
+    if (!this.db) {
+      logger.error(
+        '[DatabaseService] tableExists called but database is not connected.'
+      )
+      throw new Error('Database is not connected')
+    }
+    return new Promise((resolve, reject) => {
+      this.db!.get(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        [tableName],
+        (err, row) => {
+          if (err) {
+            logger.error(
+              `Error checking if table ${tableName} exists: ${err.message}`
+            )
+            reject(err)
+          } else {
+            resolve(!!row)
+          }
+        }
+      )
+    })
+  }
+
+  async initializeDatabase(): Promise<void> {
+    if (!this.db) {
+      logger.info(
+        '[DatabaseService] Connecting DB within initializeDatabase...'
+      )
+      await this.connect()
+    } else {
+      logger.debug('[DatabaseService] DB already connected for initialization.')
+    }
+    try {
+      logger.info('[DatabaseService] Checking if tables exist...')
+      const tablesExist = await this.tableExists('tasks')
+      logger.info(
+        `[DatabaseService] 'tasks' table exists check returned: ${tablesExist}`
+      )
+      if (!tablesExist) {
+        logger.info(
+          '[DatabaseService] Initializing database schema as tables do not exist...'
+        )
+        await this.runSchemaFromFile()
+        logger.info(
+          '[DatabaseService] Database schema initialization complete.'
+        )
+      } else {
+        logger.info(
+          '[DatabaseService] Database tables already exist. Skipping schema initialization.'
+        )
+      }
+    } catch (error: any) {
+      logger.error(`Error during database initialization: ${error.message}`, {
+        stack: error.stack,
+      })
+      console.error('Error initializing database:', error)
+      throw error
+    }
   }
 
   async runMigrations(): Promise<void> {
@@ -103,38 +271,27 @@ class DatabaseService {
     }
   }
 
-  private async runSchemaFromFile(): Promise<void> {
-    const schemaPath = path.join(process.cwd(), 'src', 'config', 'schema.sql')
-
-    if (!fs.existsSync(schemaPath)) {
-      throw new Error(`Schema file not found at ${schemaPath}`)
-    }
-
-    const schema = fs.readFileSync(schemaPath, 'utf8')
-    const statements = schema
-      .split(';')
-      .map((statement) => statement.trim())
-      .filter((statement) => statement.length > 0)
-
-    for (const statement of statements) {
-      await this.run(`${statement};`)
-    }
-  }
-
   private async runMigrationsFromFile(): Promise<void> {
+    // Use __dirname to reliably locate the file relative to the compiled JS file
     const migrationsPath = path.join(
-      process.cwd(),
-      'src',
+      __dirname,
+      '..',
       'config',
       'migrations.sql'
     )
+    console.log(
+      `[DB Service] Attempting to load migrations from: ${migrationsPath}`
+    ) // Log path
 
     if (!fs.existsSync(migrationsPath)) {
       console.log(
-        `Migrations file not found at ${migrationsPath}, skipping migrations`
+        `[DB Service] Migrations file not found at ${migrationsPath}, skipping migrations.` // Adjusted log level
       )
       return
     }
+    console.log(
+      `[DB Service] Migrations file found at ${migrationsPath}. Reading...`
+    ) // Log if found
 
     const migrations = fs.readFileSync(migrationsPath, 'utf8')
     const statements = migrations
@@ -142,32 +299,35 @@ class DatabaseService {
       .map((statement) => statement.trim())
       .filter((statement) => statement.length > 0)
 
+    console.log(
+      `[DB Service] Executing ${statements.length} statements from migrations.sql...`
+    ) // Log count
     for (const statement of statements) {
       try {
-        await this.run(`${statement};`)
-      } catch (error) {
-        // Some migrations might fail if the column already exists, which is expected
         console.log(
-          `Migration statement failed, likely already applied: ${statement}`
-        )
+          `[DB Service] Executing migration statement: ${statement.substring(
+            0,
+            100
+          )}...`
+        ) // Log statement (truncated)
+        await this.runAsync(statement)
+      } catch (error: any) {
+        // Only ignore the error if it's specifically about a duplicate column
+        if (error?.message?.includes('duplicate column name')) {
+          console.log(
+            `[DB Service] Migration statement likely already applied (duplicate column): ${statement}` // Adjusted log
+          )
+        } else {
+          // Re-throw any other error during migration
+          console.error(
+            `[DB Service] Migration statement failed: ${statement}`,
+            error
+          ) // Adjusted log
+          throw error
+        }
       }
     }
-  }
-
-  async run(sql: string, params: any[] = []): Promise<sqlite3.RunResult> {
-    if (!this.db) {
-      throw new Error('Database is not connected')
-    }
-
-    return new Promise((resolve, reject) => {
-      this.db!.run(sql, params, function (err) {
-        if (err) {
-          reject(`Error executing SQL: ${err.message}`)
-          return
-        }
-        resolve(this)
-      })
-    })
+    console.log(`[DB Service] Finished executing migration statements.`) // Log completion
   }
 
   async get(sql: string, params: any[] = []): Promise<any> {
@@ -201,36 +361,6 @@ class DatabaseService {
       })
     })
   }
-
-  async tableExists(tableName: string): Promise<boolean> {
-    try {
-      const result = await this.get(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        [tableName]
-      )
-      return !!result
-    } catch (error) {
-      console.error(`Error checking if table ${tableName} exists:`, error)
-      return false
-    }
-  }
-
-  async initializeDatabase(): Promise<void> {
-    try {
-      await this.connect()
-      const tablesExist = await this.tableExists('tasks')
-
-      if (!tablesExist) {
-        console.log('Initializing database schema...')
-        await this.runMigrations()
-      }
-    } catch (error) {
-      console.error('Error initializing database:', error)
-      throw error
-    }
-  }
-
-  // Task CRUD Operations
 
   async getTasksByFeatureId(featureId: string): Promise<Task[]> {
     if (!this.db) {
@@ -300,7 +430,7 @@ class DatabaseService {
     const timestamp = task.created_at || now
 
     try {
-      await this.run(
+      await this.runAsync(
         `INSERT INTO tasks (
           id, title, description, status, 
           completed, effort, feature_id, parent_task_id,
@@ -343,14 +473,14 @@ class DatabaseService {
       let result
 
       if (completed !== undefined) {
-        result = await this.run(
+        result = await this.runAsync(
           `UPDATE tasks 
            SET status = ?, completed = ?, updated_at = ? 
            WHERE id = ?`,
           [status, completed ? 1 : 0, now, taskId]
         )
       } else {
-        result = await this.run(
+        result = await this.runAsync(
           `UPDATE tasks 
            SET status = ?, updated_at = ? 
            WHERE id = ?`,
@@ -395,7 +525,7 @@ class DatabaseService {
         updated_at: now,
       }
 
-      const result = await this.run(
+      const result = await this.runAsync(
         `UPDATE tasks 
          SET title = ?, description = ?, effort = ?, parent_task_id = ?, updated_at = ?, from_review = ? 
          WHERE id = ?`,
@@ -424,27 +554,27 @@ class DatabaseService {
 
     try {
       // Begin transaction
-      await this.run('BEGIN TRANSACTION')
+      await this.runAsync('BEGIN TRANSACTION')
 
       try {
         // Delete any task relationships first
-        await this.run(
+        await this.runAsync(
           'DELETE FROM task_relationships WHERE parent_id = ? OR child_id = ?',
           [taskId, taskId]
         )
 
         // Finally delete the task
-        const result = await this.run('DELETE FROM tasks WHERE id = ?', [
+        const result = await this.runAsync('DELETE FROM tasks WHERE id = ?', [
           taskId,
         ])
 
         // Commit transaction
-        await this.run('COMMIT')
+        await this.runAsync('COMMIT')
 
         return result.changes > 0
       } catch (error) {
         // Rollback in case of error
-        await this.run('ROLLBACK')
+        await this.runAsync('ROLLBACK')
         throw error
       }
     } catch (error) {
@@ -501,7 +631,7 @@ class DatabaseService {
         : entry.content
 
     try {
-      const result = await this.run(
+      const result = await this.runAsync(
         `INSERT INTO history_entries (
           timestamp, role, content, feature_id,
           task_id, action, details
@@ -530,7 +660,7 @@ class DatabaseService {
     }
 
     try {
-      const result = await this.run(
+      const result = await this.runAsync(
         'DELETE FROM history_entries WHERE feature_id = ?',
         [featureId]
       )
