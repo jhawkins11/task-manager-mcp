@@ -4,7 +4,7 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "npm run build:frontend && npm run build:server",
-    "build:server": "tsc",
+    "build:server": "tsc && mkdir -p dist/config && cp src/config/*.sql dist/config/",
     "build:frontend": "cd frontend && npm run build && cd .. && mkdir -p dist/frontend-ui && cp -r frontend/build/* dist/frontend-ui/",
     "start": "node dist/server.js",
     "dev": "nodemon --watch src --ext ts --exec ts-node src/server.ts"
