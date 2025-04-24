@@ -555,20 +555,31 @@
 		}
 	});
 
-	function toggleTaskStatus(taskId: string) {
+	async function toggleTaskStatus(taskId: string) {
 		const tasksList = $tasks;
 		const taskIndex = tasksList.findIndex((t) => t.id === taskId);
 		if (taskIndex !== -1) {
 			const task = tasksList[taskIndex];
 			const newStatus = task.status === TaskStatus.COMPLETED ? TaskStatus.PENDING : TaskStatus.COMPLETED;
-			tasks.update(currentTasks =>
-				currentTasks.map(t =>
-					t.id === taskId
-						? { ...t, status: newStatus, completed: newStatus === TaskStatus.COMPLETED }
-						: t
-				)
-			);
-			processNestedTasks();
+			try {
+				// Make API call to update status in backend
+				const response = await fetch(`/api/tasks/${taskId}`, {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						featureId: task.feature_id,
+						status: newStatus,
+						completed: newStatus === TaskStatus.COMPLETED
+					})
+				});
+				if (!response.ok) {
+					throw new Error('Failed to update task status');
+				}
+				// Optionally update local store or rely on WebSocket update
+			} catch (err) {
+				console.error('Failed to update task status:', err);
+				// Optionally show error to user
+			}
 		}
 	}
 
@@ -785,11 +796,7 @@
 								   {isInProgress ? 'in-progress-shine relative overflow-hidden' : ''}
 								   {(task.status === TaskStatus.COMPLETED || (task.status === TaskStatus.DECOMPOSED && areAllChildrenComplete)) ? 'opacity-60' : ''}"
 						>
-							{#if isNextPending}
-								<div class="flex items-center justify-center h-6 w-6 mt-1">
-									<Loader2 class="h-4 w-4 animate-spin text-primary" />
-								</div>
-							{:else if task.status === TaskStatus.DECOMPOSED}
+							{#if task.status === TaskStatus.DECOMPOSED}
 								<div class="flex items-center justify-center h-6 w-6 mt-1 text-muted-foreground">
 									<CornerDownRight class="h-4 w-4" />
 								</div>
@@ -864,9 +871,9 @@
 											   {isChildInProgress ? 'in-progress-shine relative overflow-hidden' : ''}
 											   {childTask.status === TaskStatus.COMPLETED ? 'opacity-60' : ''}"
 									>
-										{#if isChildNextPending}
-											<div class="flex items-center justify-center h-6 w-6 mt-1">
-												<Loader2 class="h-4 w-4 animate-spin text-primary" />
+										{#if childTask.status === TaskStatus.DECOMPOSED}
+											<div class="flex items-center justify-center h-6 w-6 mt-1 text-muted-foreground">
+												<CornerDownRight class="h-4 w-4" />
 											</div>
 										{:else}
 											<Checkbox 

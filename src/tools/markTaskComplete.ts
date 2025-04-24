@@ -4,6 +4,7 @@ import webSocketService from '../services/webSocketService'
 import { databaseService } from '../services/databaseService'
 import { addHistoryEntry } from '../lib/dbUtils'
 import { AUTO_REVIEW_ON_COMPLETION } from '../config'
+import { handleReviewChanges } from '../tools/reviewChanges'
 
 interface MarkTaskCompleteParams {
   task_id: string
@@ -275,33 +276,97 @@ async function getNextTaskAfterCompletion(
   // Find the first pending task in the list
   const nextTask = tasks.find((task) => task.status === 'pending')
 
+  // Prevent infinite review loop: only trigger review if there are no review tasks yet
+  const hasReviewTasks = tasks.some((task) => task.fromReview)
+
   if (!nextTask) {
     await logToFile(
-      `[TaskServer] No pending tasks remaining for feature ID: ${featureId}`
+      `[TaskServer] No pending tasks remaining for feature ID: ${featureId}. Completion message: "${completionMessage}"`
     )
 
-    let message = `${completionMessage}\n\nAll tasks have been completed for this feature.`
+    let finalMessage = `${completionMessage}\n\nAll tasks have been completed for this feature.`
     const historyPayload: any = {
       tool: 'mark_task_complete',
       isError: false,
-      message: message, // Keep original message for history
+      message: finalMessage, // Keep original message for history initially
       status: 'all_completed',
     }
-    let resultPayload: any = [{ type: 'text', text: message }]
+    let resultPayload: any = [{ type: 'text', text: finalMessage }]
 
-    // Check if auto-review is enabled
-    if (AUTO_REVIEW_ON_COMPLETION) {
+    // Only trigger auto-review if there are no review tasks yet
+    if (AUTO_REVIEW_ON_COMPLETION && !hasReviewTasks) {
       await logToFile(
-        `[TaskServer] Auto-review enabled for feature ${featureId}`
+        `[TaskServer] Auto-review enabled for feature ${featureId}. Initiating review.`
       )
-      // Modify message and payload for auto-review
-      message = `${message}\n\nInitiating automatic review...` // Update message for response
-      historyPayload.status = 'all_completed_auto_review' // Update history status
+      historyPayload.status = 'all_completed_auto_review_started' // Update history status
       historyPayload.autoReviewTriggered = true
-      resultPayload = [
-        { type: 'text', text: message }, // Send updated message
-        { type: 'tool_code', text: 'review' }, // Instruct client to run review
-      ]
+
+      try {
+        // Call handleReviewChanges to generate and save review tasks
+        const reviewResult = await handleReviewChanges({ featureId: featureId })
+
+        if (reviewResult.isError) {
+          finalMessage += `\n\nAuto-review failed: ${
+            reviewResult.content[0]?.text || 'Unknown error'
+          }`
+          historyPayload.isError = true
+          historyPayload.reviewError = reviewResult.content[0]?.text
+          logToFile(
+            `[TaskServer] Auto-review process failed for ${featureId}: ${reviewResult.content[0]?.text}`
+          )
+        } else {
+          // Review succeeded, tasks were added (or no tasks were needed)
+          logToFile(
+            `[TaskServer] Auto-review process completed for ${featureId}. Fetching updated tasks...`
+          )
+
+          // Fetch the updated task list including any new review tasks
+          let updatedTasks: Task[] = []
+          try {
+            await databaseService.connect()
+            const dbFinalState = await databaseService.getTasksByFeatureId(
+              featureId
+            )
+            updatedTasks = dbFinalState.map(mapDatabaseTaskToAppTask)
+            await databaseService.close()
+            logToFile(
+              `[TaskServer] Fetched ${updatedTasks.length} total tasks for ${featureId} after review.`
+            )
+
+            // Notify UI with the updated task list
+            webSocketService.notifyTasksUpdated(featureId, updatedTasks)
+            logToFile(
+              `[TaskServer] Sent tasks_updated notification for ${featureId} after review.`
+            )
+
+            finalMessage += `\n\nAuto-review completed. Review tasks may have been added.`
+            historyPayload.status = 'all_completed_auto_review_finished' // Update history status
+            historyPayload.reviewResult = reviewResult.content[0]?.text // Log the original review result text
+          } catch (dbError) {
+            const dbErrorMsg = `Error fetching/updating tasks after review: ${
+              dbError instanceof Error ? dbError.message : String(dbError)
+            }`
+            logToFile(`[TaskServer] ${dbErrorMsg}`)
+            finalMessage += `\n\nAuto-review ran, but failed to update task list: ${dbErrorMsg}`
+            historyPayload.isError = true // Mark history as error if fetching/notifying fails
+            historyPayload.postReviewError = dbErrorMsg
+          }
+        }
+
+        // Update the result payload with the final message
+        resultPayload = [{ type: 'text', text: finalMessage }]
+      } catch (reviewError) {
+        const reviewErrorMsg = `Error during auto-review execution: ${
+          reviewError instanceof Error
+            ? reviewError.message
+            : String(reviewError)
+        }`
+        logToFile(`[TaskServer] ${reviewErrorMsg}`)
+        finalMessage += `\n\nAuto-review execution failed: ${reviewErrorMsg}`
+        historyPayload.isError = true
+        historyPayload.reviewExecutionError = reviewErrorMsg
+        resultPayload = [{ type: 'text', text: finalMessage }]
+      }
     }
 
     // Record completion/review trigger in history

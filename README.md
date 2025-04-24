@@ -17,6 +17,7 @@ In addition, it includes a Svelte UI that allows you to view the task list and p
 - **Clarification Workflow:** Handles cases where the LLM needs more info, pausing planning and interacting with a connected UI via WebSockets.
 - **Task CRUD:** Allows for creating, reading, updating, and deleting tasks via the UI.
 - **Code Review:** Analyzes `git diff HEAD` output using an LLM and creates new tasks if needed.
+- **Automatic Review (Optional):** If configured (`AUTO_REVIEW_ON_COMPLETION=true`), automatically runs the code review process after the last original task for a feature is completed.
 - **Plan Adjustment:** Allows for adjusting the plan after it's created via the `adjust_plan` tool.
 
 ## Setup
@@ -91,7 +92,7 @@ UI_PORT=4999
 WS_PORT=4999
 
 # === Auto Review ===
-# If true, the agent will automatically run the 'review' tool after the last task is completed.
+# If true, the agent will automatically run the 'review_changes' tool after the last task is completed.
 # Defaults to false.
 AUTO_REVIEW_ON_COMPLETION=false
 ```

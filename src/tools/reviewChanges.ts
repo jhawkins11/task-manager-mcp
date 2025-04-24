@@ -346,7 +346,7 @@ Do NOT include summaries, commentary, or anything outside this JSON structure. D
       if ('chat' in reviewModel) {
         // OpenRouter
         const structuredResult = await aiService.callOpenRouterWithSchema(
-          process.env.OPENROUTER_MODEL || 'google/gemini-flash-1.5:free', // Use configured or default for review
+          OPENROUTER_MODEL, // Use configured or default for review
           [{ role: 'user', content: structuredPrompt }],
           PlanFeatureResponseSchema, // Use the task list schema
           { temperature: 0.5 } // Slightly higher temp might be ok for task generation
