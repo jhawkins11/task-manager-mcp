@@ -313,6 +313,7 @@ function formatTaskForFrontend(task: any, featureId: string) {
       typeof task.updated_at === 'number'
         ? new Date(task.updated_at * 1000).toISOString()
         : task.updatedAt,
+    fromReview: task.fromReview || task.from_review === 1,
   }
 }
 
