@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS features (
   id TEXT PRIMARY KEY,
   description TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'completed', 'abandoned')),
+  project_path TEXT,
   created_at INTEGER NOT NULL, -- Unix timestamp
   updated_at INTEGER NOT NULL -- Unix timestamp
 );

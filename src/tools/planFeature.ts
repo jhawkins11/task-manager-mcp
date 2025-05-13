@@ -91,6 +91,23 @@ export async function handlePlanFeature(
       params: { feature_description, project_path },
     })
 
+    // Create the feature record with project_path
+    try {
+      await databaseService.createFeature(
+        featureId,
+        feature_description,
+        project_path
+      )
+      await logToFile(
+        `[TaskServer] Created feature record with ID: ${featureId}, Project Path: ${project_path}`
+      )
+    } catch (featureError) {
+      await logToFile(
+        `[TaskServer] Error creating feature record: ${featureError}`
+      )
+      // Continue even if feature creation fails - we can recover later
+    }
+
     const planningModel = aiService.getPlanningModel()
 
     if (!planningModel) {

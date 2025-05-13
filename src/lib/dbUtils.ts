@@ -1,4 +1,4 @@
-import { databaseService } from '../services/databaseService'
+import { databaseService, HistoryEntry } from '../services/databaseService'
 import crypto from 'crypto'
 
 // Types
@@ -234,7 +234,7 @@ export async function deleteTask(taskId: string): Promise<boolean> {
 export async function getHistoryForFeature(
   featureId: string,
   limit: number = 100
-): Promise<any[]> {
+): Promise<HistoryEntry[]> {
   try {
     await databaseService.connect()
     const history = await databaseService.getHistoryByFeatureId(
@@ -435,5 +435,54 @@ export async function clearPlanningStatesForFeature(
       `[TaskServer] Error clearing planning states for feature ${featureId}: ${error}`
     )
     return 0
+  }
+}
+
+// Utility to get project_path from feature record
+export async function getProjectPathForFeature(
+  featureId: string
+): Promise<string | undefined> {
+  try {
+    await databaseService.connect()
+
+    // First try to get it from the feature record
+    const feature = await databaseService.getFeatureById(featureId)
+    if (feature && feature.project_path) {
+      await databaseService.close()
+      return feature.project_path
+    }
+
+    // Fallback to the old method if needed
+    const history = await getHistoryForFeature(featureId, 50) // limit to 50 for efficiency
+    const firstToolCall = history.find(
+      (entry: any) =>
+        entry.role === 'tool_call' &&
+        entry.content &&
+        entry.content.tool === 'plan_feature' &&
+        entry.content.params &&
+        entry.content.params.project_path
+    )
+
+    // If we found it in history but not in the feature record, update the feature record for next time
+    const projectPath = JSON.parse(firstToolCall?.content || '{}')?.params
+      ?.project_path
+    if (projectPath && feature) {
+      try {
+        await databaseService.runAsync(
+          'UPDATE features SET project_path = ? WHERE id = ?',
+          [projectPath, featureId]
+        )
+      } catch (updateError) {
+        console.error(
+          `[getProjectPathForFeature] Error updating project_path: ${updateError}`
+        )
+      }
+    }
+
+    await databaseService.close()
+    return projectPath
+  } catch (e) {
+    await databaseService.close()
+    return undefined
   }
 }

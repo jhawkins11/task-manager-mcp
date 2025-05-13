@@ -30,7 +30,7 @@ interface TaskUpdate {
 }
 
 // Define History Entry type for database operations
-interface HistoryEntry {
+export interface HistoryEntry {
   id?: number
   timestamp: number
   role: 'user' | 'model' | 'tool_call' | 'tool_response'
@@ -669,6 +669,62 @@ class DatabaseService {
     } catch (error) {
       console.error(`Error deleting history for feature ${featureId}:`, error)
       throw error
+    }
+  }
+
+  // Feature Management
+
+  /**
+   * Creates a new feature in the database
+   * @param id The feature ID
+   * @param description The feature description
+   * @param projectPath The project path for the feature
+   * @returns The created feature
+   */
+  async createFeature(
+    id: string,
+    description: string,
+    projectPath: string
+  ): Promise<{ id: string; description: string; project_path: string }> {
+    try {
+      const now = Math.floor(Date.now() / 1000)
+
+      await this.runAsync(
+        `INSERT INTO features (id, description, project_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [id, description, projectPath, now, now]
+      )
+
+      return { id, description, project_path: projectPath }
+    } catch (error) {
+      console.error(`Error creating feature:`, error)
+      throw error
+    }
+  }
+
+  /**
+   * Gets a feature by ID
+   * @param featureId The feature ID
+   * @returns The feature or null if not found
+   */
+  async getFeatureById(featureId: string): Promise<{
+    id: string
+    description: string
+    project_path: string | null
+    status: string
+  } | null> {
+    try {
+      const feature = await this.get(
+        `SELECT id, description, project_path, status
+         FROM features
+         WHERE id = ?`,
+        [featureId]
+      )
+
+      return feature || null
+    } catch (error) {
+      console.error(`Error fetching feature ${featureId}:`, error)
+      return null
     }
   }
 }
