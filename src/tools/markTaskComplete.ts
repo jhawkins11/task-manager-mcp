@@ -2,9 +2,11 @@ import { Task } from '../models/types'
 import { logToFile } from '../lib/logger'
 import webSocketService from '../services/webSocketService'
 import { databaseService } from '../services/databaseService'
-import { addHistoryEntry } from '../lib/dbUtils'
+import { addHistoryEntry, getProjectPathForFeature } from '../lib/dbUtils'
 import { AUTO_REVIEW_ON_COMPLETION } from '../config'
 import { handleReviewChanges } from '../tools/reviewChanges'
+import fs from 'fs/promises'
+import path from 'path'
 
 interface MarkTaskCompleteParams {
   task_id: string
@@ -302,8 +304,13 @@ async function getNextTaskAfterCompletion(
       historyPayload.autoReviewTriggered = true
 
       try {
+        // Retrieve project_path for this feature
+        const project_path = await getProjectPathForFeature(featureId)
         // Call handleReviewChanges to generate and save review tasks
-        const reviewResult = await handleReviewChanges({ featureId: featureId })
+        const reviewResult = await handleReviewChanges({
+          featureId: featureId,
+          project_path,
+        })
 
         if (reviewResult.isError) {
           finalMessage += `\n\nAuto-review failed: ${

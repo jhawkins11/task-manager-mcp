@@ -5,8 +5,13 @@ import { aiService } from '../services/aiService'
 import { promisify } from 'util'
 import { exec } from 'child_process'
 import crypto from 'crypto'
-// Import the correct schema for task list output
-import { PlanFeatureResponseSchema, Task } from '../models/types'
+// Import the correct schema for task list output and other necessary types
+import {
+  Task,
+  ReviewResponseWithTasksSchema, // Schema for review task output
+  PlanFeatureResponseSchema, // Schema for initial plan (if used elsewhere)
+  type Task as AppTask, // Rename if needed to avoid conflict with local Task type/variable
+} from '../models/types'
 import { z } from 'zod'
 import {
   parseAndValidateJsonResponse,
@@ -273,7 +278,7 @@ export async function handleReviewChanges(
       // Fetch history to get original feature request
       let originalFeatureRequest = 'Original feature request not found.'
       try {
-        const history = await getHistoryForFeature(featureId, 200) // Fetch more history if needed
+        const history: any[] = await getHistoryForFeature(featureId, 200) // Fetch more history if needed
         const planFeatureCall = history.find(
           (entry) =>
             entry.role === 'tool_call' &&
@@ -322,7 +327,6 @@ ${contextPromptPart}
 4.  **Maintainability:** Easy to modify/debug/test? Clean dependencies?
 5.  **Performance:** Obvious bottlenecks?
 6.  **Security:** Potential vulnerabilities (input validation, etc.)?
-7.  **Testing:** Are tests needed/adequate (if context allows)?
 
 **Output Format:**
 Respond ONLY with a single valid JSON object matching this exact schema:
@@ -348,7 +352,7 @@ Do NOT include summaries, commentary, or anything outside this JSON structure. D
         const structuredResult = await aiService.callOpenRouterWithSchema(
           OPENROUTER_MODEL, // Use configured or default for review
           [{ role: 'user', content: structuredPrompt }],
-          PlanFeatureResponseSchema, // Use the task list schema
+          ReviewResponseWithTasksSchema, // *** USE THE CORRECT SCHEMA HERE ***
           { temperature: 0.5 } // Slightly higher temp might be ok for task generation
         )
         rawLLMResponse = structuredResult.rawResponse
@@ -390,12 +394,12 @@ Do NOT include summaries, commentary, or anything outside this JSON structure. D
           }
           return { content: [{ type: 'text', text: message }], isError }
         }
-      } else {
+      } else if ('generateContentStream' in reviewModel) {
         // Gemini
         const structuredResult = await aiService.callGeminiWithSchema(
           process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest',
           structuredPrompt,
-          PlanFeatureResponseSchema, // Use the task list schema
+          ReviewResponseWithTasksSchema, // *** USE THE CORRECT SCHEMA HERE ***
           { temperature: 0.5 }
         )
         rawLLMResponse = structuredResult.rawResponse
@@ -437,6 +441,25 @@ Do NOT include summaries, commentary, or anything outside this JSON structure. D
           }
           return { content: [{ type: 'text', text: message }], isError }
         }
+      } else {
+        message = 'Error: Review model does not support structured output.'
+        isError = true
+        logToFile(`[TaskServer] ${message} (Review ID: ${reviewId})`)
+        // Wrap history logging
+        try {
+          await addHistoryEntry(featureId, 'tool_response', {
+            tool: 'review_changes',
+            isError,
+            message,
+            reviewId,
+            step: 'llm_structured_fail',
+          })
+        } catch (historyError) {
+          console.error(
+            `[TaskServer] Failed to add history entry for structured fail: ${historyError}`
+          )
+        }
+        return { content: [{ type: 'text', text: message }], isError }
       }
 
       // --- Process and Save Generated Tasks ---
