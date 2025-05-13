@@ -297,6 +297,84 @@ export function extractEffort(taskDescription: string): {
 }
 
 /**
+ * A more robust approach to parsing LLM-generated JSON that might be malformed due to newlines
+ * or other common issues in AI responses.
+ */
+function robustJsonParse(text: string): any {
+  // First attempt: Try with standard JSON.parse
+  try {
+    return JSON.parse(text)
+  } catch (error: any) {
+    // If standard parsing fails, try more aggressive fixing
+    logToFile(
+      `[robustJsonParse] Standard parsing failed, attempting recovery: ${error}`
+    )
+
+    try {
+      // Special handling for common OpenRouter/AI model response patterns
+      if (
+        text.includes('"tasks"') &&
+        text.includes('"description"') &&
+        text.includes('"effort"')
+      ) {
+        // 1. Extract all individual task objects as best as we can
+        const taskRegex =
+          /"description"\s*:\s*"((?:[^"\\]|\\"|\\)*)"\s*,\s*"effort"\s*:\s*"(low|medium|high)"/g
+        const tasks = []
+        let match
+
+        while ((match = taskRegex.exec(text)) !== null) {
+          try {
+            if (match[1] && match[2]) {
+              tasks.push({
+                description: match[1].replace(/\\"/g, '"'),
+                effort: match[2],
+              })
+            }
+          } catch (innerError) {
+            logToFile(`[robustJsonParse] Error extracting task: ${innerError}`)
+          }
+        }
+
+        if (tasks.length > 0) {
+          logToFile(
+            `[robustJsonParse] Successfully extracted ${tasks.length} tasks with regex`
+          )
+          return { tasks }
+        }
+      }
+
+      // 2. Fall back to manual line-by-line parsing for JSON objects
+      const lines = text.split('\n')
+      let cleanJson = ''
+      let inString = false
+
+      for (const line of lines) {
+        let processedLine = line
+
+        // Count quote marks to track if we're inside a string
+        for (let i = 0; i < line.length; i++) {
+          if (line[i] === '"' && (i === 0 || line[i - 1] !== '\\')) {
+            inString = !inString
+          }
+        }
+
+        // Add a space instead of newline if we're in the middle of a string
+        cleanJson += inString ? ' ' + processedLine : processedLine
+      }
+
+      // Final attempt to parse the cleaned JSON
+      return JSON.parse(cleanJson)
+    } catch (recoveryError) {
+      logToFile(
+        `[robustJsonParse] All recovery attempts failed: ${recoveryError}`
+      )
+      throw new Error(`Failed to parse JSON: ${error.message}`)
+    }
+  }
+}
+
+/**
  * Parses and validates a JSON response string against a provided Zod schema.
  *
  * @param responseText - The raw JSON string from the LLM response
@@ -318,6 +396,18 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
     }
   }
 
+  // Enhanced logging for debugging
+  try {
+    logToFile(
+      `[parseAndValidateJsonResponse] Raw response text: ${responseText?.substring(
+        0,
+        1000
+      )}`
+    )
+  } catch (logError) {
+    // Ignore logging errors
+  }
+
   // Extract JSON from the response if it's wrapped in markdown or other text
   let jsonString = responseText
 
@@ -327,11 +417,70 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
     jsonString = jsonBlockMatch[1]
   }
 
-  // Attempt to parse the JSON
+  // --- Additional cleaning: extract first valid JSON object from text ---
+  function extractJsonFromText(text: string): string {
+    // Remove markdown code fences
+    text = text.replace(/```(?:json)?/gi, '').replace(/```/g, '')
+    // Find the first { and last }
+    const firstBrace = text.indexOf('{')
+    const lastBrace = text.lastIndexOf('}')
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      return text.substring(firstBrace, lastBrace + 1)
+    }
+    return text.trim()
+  }
+  jsonString = extractJsonFromText(jsonString)
+  // --- End cleaning ---
+
+  // --- Auto-fix common JSON issues (trailing commas, comments) ---
+  function fixCommonJsonIssues(text: string): string {
+    // Remove JavaScript-style comments
+    text = text.replace(/\/\/.*$/gm, '')
+    text = text.replace(/\/\*[\s\S]*?\*\//g, '')
+    // Remove trailing commas in objects and arrays
+    text = text.replace(/,\s*([}\]])/g, '$1')
+
+    // Fix broken newlines in the middle of strings
+    text = text.replace(/([^\\])"\s*\n\s*"/g, '$1')
+
+    // Normalize string values that got broken across lines
+    text = text.replace(/([^\\])"\s*\n\s*([^"])/g, '$1", "$2')
+
+    // Fix incomplete JSON objects
+    const openBraces = (text.match(/\{/g) || []).length
+    const closeBraces = (text.match(/\}/g) || []).length
+    if (openBraces > closeBraces) {
+      text = text + '}'.repeat(openBraces - closeBraces)
+    }
+
+    return text
+  }
+  jsonString = fixCommonJsonIssues(jsonString)
+  // --- End auto-fix ---
+
+  try {
+    logToFile(
+      `[parseAndValidateJsonResponse] Cleaned JSON string: ${jsonString?.substring(
+        0,
+        1000
+      )}`
+    )
+  } catch (logError) {
+    // Ignore logging errors
+  }
+
+  // Attempt to parse the JSON using robust parser
   let parsedData: any
   try {
-    parsedData = JSON.parse(jsonString)
+    parsedData = robustJsonParse(jsonString)
+    logToFile(
+      `[parseAndValidateJsonResponse] JSON parsed successfully with robust parser`
+    )
   } catch (parseError) {
+    // All parsing methods have failed
+    logToFile(
+      `[parseAndValidateJsonResponse] All parsing attempts failed: ${parseError}`
+    )
     return {
       success: false,
       error: `Failed to parse JSON: ${(parseError as Error).message}`,
@@ -348,6 +497,28 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
       data: validationResult.data,
     }
   } else {
+    // Enhanced logging for schema validation errors
+    try {
+      logToFile(
+        `[parseAndValidateJsonResponse] Schema validation failed. Errors: ${JSON.stringify(
+          validationResult.error.errors
+        )} | Parsed data: ${JSON.stringify(parsedData)?.substring(0, 1000)}`
+      )
+
+      // Try to recover partial response if possible
+      const recoveredData = attemptPartialResponseRecovery(parsedData, schema)
+      if (recoveredData) {
+        logToFile(
+          `[parseAndValidateJsonResponse] Successfully recovered partial response`
+        )
+        return {
+          success: true,
+          data: recoveredData,
+        }
+      }
+    } catch (logError) {
+      // Ignore logging errors
+    }
     // Format Zod errors into a more readable string
     const formattedErrors = validationResult.error.errors
       .map((err) => `${err.path.join('.')}: ${err.message}`)
@@ -358,6 +529,58 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
       error: `Schema validation failed: ${formattedErrors}`,
       rawData: parsedData,
     }
+  }
+}
+
+/**
+ * Attempts to recover a partial JSON response when schema validation fails.
+ * Useful for handling truncated responses from models.
+ *
+ * @param parsedData The parsed but invalid JSON data
+ * @param schema The Zod schema to validate against
+ * @returns Recovered data that passes validation, or null if recovery failed
+ */
+function attemptPartialResponseRecovery(
+  parsedData: any,
+  schema: z.ZodType
+): any | null {
+  try {
+    logToFile(
+      `[attemptPartialResponseRecovery] Attempting recovery of partial JSON response`
+    )
+
+    // Handle common case: tasks array with valid and invalid items
+    if (parsedData && parsedData.tasks && Array.isArray(parsedData.tasks)) {
+      // Filter out invalid task items
+      const validTasks = parsedData.tasks.filter(
+        (task: any) =>
+          task &&
+          typeof task === 'object' &&
+          task.description &&
+          task.effort &&
+          typeof task.description === 'string' &&
+          typeof task.effort === 'string'
+      )
+
+      if (validTasks.length > 0) {
+        const recoveredData = { ...parsedData, tasks: validTasks }
+        const validationResult = schema.safeParse(recoveredData)
+
+        if (validationResult.success) {
+          logToFile(
+            `[attemptPartialResponseRecovery] Recovery successful, found ${validTasks.length} valid tasks`
+          )
+          return validationResult.data
+        }
+      }
+    }
+
+    return null
+  } catch (error) {
+    logToFile(
+      `[attemptPartialResponseRecovery] Recovery attempt failed: ${error}`
+    )
+    return null
   }
 }
 
@@ -711,10 +934,12 @@ export async function processAndFinalizePlan(
       }
     }
 
-    // Identify tasks to delete (exist in DB but not in new plan)
-    for (const existingTask of existingTasks) {
-      if (!processedTaskMap.has(existingTask.id)) {
-        taskIdsToDelete.push(existingTask.id)
+    if (!fromReview) {
+      // Identify tasks to delete (exist in DB but not in new plan)
+      for (const existingTask of existingTasks) {
+        if (!processedTaskMap.has(existingTask.id)) {
+          taskIdsToDelete.push(existingTask.id)
+        }
       }
     }
 
@@ -817,26 +1042,40 @@ export async function processAndFinalizePlan(
 
   // 7. Notify UI about the updated tasks (outside the main try/catch for DB ops)
   try {
-    const formattedTasks = finalTasks.map((task) => ({
-      // Basic formatting for WS
-      id: task.id,
-      description: task.description,
-      status: task.status,
-      effort: task.effort,
-      // Map snake_case from DB task to camelCase for WebSocket payload
-      parentTaskId: task.parentTaskId,
-      completed: task.completed, // DB Service already converts this to boolean
-      title: task.title,
-      // Map snake_case timestamps from DB to ISO strings for WebSocket payload
-      createdAt:
-        task.createdAt && typeof task.createdAt === 'number'
-          ? new Date(task.createdAt * 1000).toISOString()
-          : undefined,
-      updatedAt:
-        task.updatedAt && typeof task.updatedAt === 'number'
-          ? new Date(task.updatedAt * 1000).toISOString()
-          : undefined,
-    }))
+    // Add detailed logging to debug
+    console.log(
+      'Full task structure sample:',
+      JSON.stringify(finalTasks[0], null, 2)
+    )
+
+    const formattedTasks = finalTasks.map((task: any) => {
+      // Create a clean task object for the WebSocket
+      return {
+        id: task.id,
+        description: task.description,
+        status: task.status,
+        effort: task.effort,
+        parentTaskId: task.parentTaskId,
+        completed: task.completed,
+        title: task.title,
+        fromReview: task.fromReview || task.from_review === 1, // Handle both camelCase and snake_case
+        createdAt:
+          typeof task.createdAt === 'number'
+            ? new Date(task.createdAt * 1000).toISOString()
+            : undefined,
+        updatedAt:
+          typeof task.updatedAt === 'number'
+            ? new Date(task.updatedAt * 1000).toISOString()
+            : undefined,
+      }
+    })
+
+    // Log the first formatted task
+    console.log(
+      'First formatted task for WebSocket:',
+      JSON.stringify(formattedTasks[0], null, 2)
+    )
+
     webSocketService.notifyTasksUpdated(featureId, formattedTasks)
     logToFile(`[processAndFinalizePlan] WebSocket notification sent.`)
   } catch (wsError) {
