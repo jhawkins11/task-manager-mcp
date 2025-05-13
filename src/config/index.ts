@@ -12,9 +12,9 @@ const SQLITE_DB_PATH =
   path.resolve(__dirname, '../../data/taskmanager.db') // Path to SQLite database file
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-pro-exp-03-25' // Default model
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-pro-preview-05-06' // Default model
 const OPENROUTER_MODEL =
-  process.env.OPENROUTER_MODEL || 'google/gemini-2.5-pro-exp-03-25:free'
+  process.env.OPENROUTER_MODEL || 'google/gemini-2.5-pro-preview'
 const FALLBACK_OPENROUTER_MODEL =
   process.env.FALLBACK_OPENROUTER_MODEL ||
   'google/gemini-2.5-flash-preview:thinking'
