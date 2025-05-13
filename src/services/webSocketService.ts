@@ -24,6 +24,7 @@ import {
 import OpenAI from 'openai'
 import { GenerativeModel } from '@google/generative-ai'
 import { z } from 'zod'
+import { databaseService } from '../services/databaseService'
 
 interface WebSocketConnection {
   socket: WebSocket
@@ -358,11 +359,23 @@ class WebSocketService {
    * Broadcasts a task update notification for a feature
    */
   public notifyTasksUpdated(featureId: string, tasks: any): void {
+    // Log tasks to help debug
+    console.log(
+      'WebSocketService.notifyTasksUpdated - Task fromReview values:',
+      tasks.map((t: any) => ({ id: t.id, fromReview: !!t.fromReview }))
+    )
+
+    // Make sure fromReview is properly formatted for all tasks
+    const formattedTasks = tasks.map((task: any) => ({
+      ...task,
+      fromReview: task.fromReview === 1 ? true : !!task.fromReview,
+    }))
+
     this.broadcast({
       type: 'tasks_updated',
       featureId,
       payload: {
-        tasks,
+        tasks: formattedTasks,
         updatedAt: new Date().toISOString(),
       },
     })
@@ -391,11 +404,17 @@ class WebSocketService {
    * Broadcasts a notification when a task is created
    */
   public notifyTaskCreated(featureId: string, task: any): void {
+    // Make sure fromReview is properly formatted
+    const formattedTask = {
+      ...task,
+      fromReview: task.fromReview === 1 ? true : !!task.fromReview,
+    }
+
     this.broadcast({
       type: 'task_created',
       featureId,
       payload: {
-        task,
+        task: formattedTask,
         featureId,
         createdAt: new Date().toISOString(),
       },
@@ -410,11 +429,17 @@ class WebSocketService {
    * Broadcasts a notification when a task is updated
    */
   public notifyTaskUpdated(featureId: string, task: any): void {
+    // Make sure fromReview is properly formatted
+    const formattedTask = {
+      ...task,
+      fromReview: task.fromReview === 1 ? true : !!task.fromReview,
+    }
+
     this.broadcast({
       type: 'task_updated',
       featureId,
       payload: {
-        task,
+        task: formattedTask,
         featureId,
         updatedAt: new Date().toISOString(),
       },
@@ -613,10 +638,37 @@ class WebSocketService {
           `[WebSocketService] Resuming ${state.planningType} with user response for feature ${featureId}`
         )
 
-        // Create a follow-up prompt including the original prompt and the user's answer
-        const followUpPrompt = `${state.prompt}\n\nUser clarification response: ${response}\n\nNow, please continue with the original task of planning the feature implementation steps.`
+        // Fetch feature information from database
+        await databaseService.connect()
+        const feature = await databaseService.getFeatureById(featureId)
+        await databaseService.close()
 
-        // Call the LLM with the follow-up prompt
+        if (!feature) {
+          throw new Error(`Feature with ID ${featureId} not found`)
+        }
+
+        // Get previous history entries for context
+        await databaseService.connect()
+        const history = await databaseService.getHistoryByFeatureId(
+          featureId,
+          10
+        )
+        await databaseService.close()
+
+        // Extract original feature description
+        const originalDescription =
+          feature.description || 'Unknown feature description'
+
+        // Create a comprehensive follow-up prompt with complete context
+        let followUpPrompt = `You previously received this feature request: "${originalDescription}"
+
+When planning this feature implementation, you asked for clarification with this question:
+${state.partialResponse}
+
+The user has now provided this answer to your question: "${response}"
+`
+
+        // Call the LLM with the comprehensive follow-up prompt
         if (planningModel instanceof OpenAI) {
           await this.processOpenRouterResumeResponse(
             planningModel,
@@ -696,7 +748,7 @@ class WebSocketService {
         OPENROUTER_MODEL,
         [{ role: 'user', content: prompt }],
         PlanFeatureResponseSchema,
-        { temperature: 0.3 }
+        { temperature: 0.3, max_tokens: 4096 }
       )
 
       if (result.success) {
