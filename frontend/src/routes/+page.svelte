@@ -8,7 +8,7 @@
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Select from '$lib/components/ui/select';
 	import { Progress } from '$lib/components/ui/progress';
-	import { Loader2, CornerDownLeft, CornerDownRight, Pencil, Trash2, FileText } from 'lucide-svelte';
+	import { Loader2, CornerDownLeft, CornerDownRight, Pencil, Trash2, FileText, Eye } from 'lucide-svelte';
 	import { writable, type Writable } from 'svelte/store';
 	import type { Task, WebSocketMessage, ShowQuestionPayload, QuestionResponsePayload } from '$lib/types';
 	import { TaskStatus, TaskEffort } from '$lib/types';
@@ -106,6 +106,10 @@
 								mapApiTaskToClientTask(task, featureId as string)
 							);
 							tasks.set(mappedTasks);
+							// Detailed logging after update
+							tasks.subscribe(currentTasks => {
+								console.log('[WS Client] tasks store after set():', currentTasks);
+							})();
 							// Explicitly set loading to false
 							loading.set(false);
 							error.set(null); // Clear any previous errors
@@ -290,7 +294,8 @@
 					feature_id: task.feature_id || selectedFeatureId || undefined,
 					parentTaskId: task.parentTaskId,
 					createdAt: task.createdAt,
-					updatedAt: task.updatedAt
+					updatedAt: task.updatedAt,
+					fromReview: task.fromReview
 				} as Task;
 			});
 			
@@ -722,7 +727,8 @@
 			feature_id: apiTask.feature_id || currentFeatureId,
 			parentTaskId: apiTask.parentTaskId,
 			createdAt: apiTask.createdAt,
-			updatedAt: apiTask.updatedAt
+			updatedAt: apiTask.updatedAt,
+			fromReview: apiTask.fromReview
 		} as Task;
 	}
 
@@ -794,21 +800,28 @@
 							class="task-row flex items-start space-x-4 p-4 hover:bg-muted/50 transition-colors 
 								   {isNextPending ? 'bg-muted/30' : ''} 
 								   {isInProgress ? 'in-progress-shine relative overflow-hidden' : ''}
-								   {(task.status === TaskStatus.COMPLETED || (task.status === TaskStatus.DECOMPOSED && areAllChildrenComplete)) ? 'opacity-60' : ''}"
+								   {(task.status === TaskStatus.COMPLETED || (task.status === TaskStatus.DECOMPOSED && areAllChildrenComplete)) ? 'opacity-60' : ''}
+								   {task.fromReview ? 'from-review-task' : ''}"
 						>
 							{#if task.status === TaskStatus.DECOMPOSED}
 								<div class="flex items-center justify-center h-6 w-6 mt-1 text-muted-foreground">
 									<CornerDownRight class="h-4 w-4" />
 								</div>
 							{:else}
-								<Checkbox 
-									id={`task-${task.id}`} 
-									checked={task.completed} 
-									onCheckedChange={() => toggleTaskStatus(task.id)} 
-									aria-labelledby={`task-label-${task.id}`}
-									class="mt-1"
-									disabled={task.status === TaskStatus.IN_PROGRESS}
-								/>
+								<div class="flex flex-col items-center gap-1">
+									<Checkbox 
+										id={`task-${task.id}`} 
+										checked={task.completed} 
+										onCheckedChange={() => toggleTaskStatus(task.id)} 
+										aria-labelledby={`task-label-${task.id}`}
+										disabled={task.status === TaskStatus.IN_PROGRESS}
+									/>
+									{#if task.fromReview}
+										<span class="review-indicator" title="Task from review">
+											<Eye size={20} />
+										</span>
+									{/if}
+								</div>
 							{/if}
 							<div class="flex-1 grid gap-1">
 								<div class="flex items-center gap-2">
@@ -819,11 +832,6 @@
 									>
 										{task.title}
 									</label>
-									{#if task.fromReview}
-										<span title="Review task">
-											<FileText class="text-blue-500 inline-block ml-1" size={16} />
-										</span>
-									{/if}
 								</div>
 								{#if task.description && task.description !== task.title}
 									<p class="text-sm text-muted-foreground">
@@ -832,9 +840,11 @@
 								{/if}
 							</div>
 							<div class="flex flex-col gap-1.5 items-end min-w-[100px]">
-								<Badge variant={getStatusBadgeVariant(task.status)} class="capitalize">
-									{task.status.replace('_', ' ')}
-								</Badge>
+								<div class="flex items-center gap-1.5">
+									<Badge variant={getStatusBadgeVariant(task.status)} class="capitalize">
+										{task.status.replace('_', ' ')}
+									</Badge>
+								</div>
 								{#if task.effort}
 									<Badge variant={getEffortBadgeVariant(task.effort)} class="capitalize">
 										{task.effort}
@@ -869,21 +879,28 @@
 										class="task-row flex items-start space-x-4 pt-3 pr-4 mb-3 
 											   {isChildNextPending ? 'bg-muted/30' : ''} 
 											   {isChildInProgress ? 'in-progress-shine relative overflow-hidden' : ''}
-											   {childTask.status === TaskStatus.COMPLETED ? 'opacity-60' : ''}"
+											   {childTask.status === TaskStatus.COMPLETED ? 'opacity-60' : ''}
+											   {childTask.fromReview ? 'from-review-task' : ''}"
 									>
 										{#if childTask.status === TaskStatus.DECOMPOSED}
 											<div class="flex items-center justify-center h-6 w-6 mt-1 text-muted-foreground">
 												<CornerDownRight class="h-4 w-4" />
 											</div>
 										{:else}
-											<Checkbox 
-												id={`task-${childTask.id}`} 
-												checked={childTask.completed} 
-												onCheckedChange={() => toggleTaskStatus(childTask.id)} 
-												aria-labelledby={`task-label-${childTask.id}`}
-												class="mt-1"
-												disabled={childTask.status === TaskStatus.IN_PROGRESS}
-											/>
+											<div class="flex flex-col items-center gap-1">
+												<Checkbox 
+													id={`task-${childTask.id}`} 
+													checked={childTask.completed} 
+													onCheckedChange={() => toggleTaskStatus(childTask.id)} 
+													aria-labelledby={`task-label-${childTask.id}`}
+													disabled={childTask.status === TaskStatus.IN_PROGRESS}
+												/>
+												{#if childTask.fromReview}
+													<span class="review-indicator" title="Task from review">
+														<Eye size={20} />
+													</span>
+												{/if}
+											</div>
 										{/if}
 										<div class="flex-1 grid gap-1">
 											<div class="flex items-center gap-2">
@@ -894,11 +911,6 @@
 												>
 													{childTask.title}
 												</label>
-												{#if childTask.fromReview}
-													<span title="Review task">
-														<FileText class="text-blue-500 inline-block ml-1" size={16} />
-													</span>
-												{/if}
 											</div>
 											{#if childTask.description && childTask.description !== childTask.title}
 												<p class="text-sm text-muted-foreground">
@@ -907,9 +919,11 @@
 											{/if}
 										</div>
 										<div class="flex flex-col gap-1.5 items-end min-w-[100px]">
-											<Badge variant={getStatusBadgeVariant(childTask.status)} class="capitalize">
-												{childTask.status.replace('_', ' ')}
-											</Badge>
+											<div class="flex items-center gap-1.5">
+												<Badge variant={getStatusBadgeVariant(childTask.status)} class="capitalize">
+													{childTask.status.replace('_', ' ')}
+												</Badge>
+											</div>
 											{#if childTask.effort}
 												<Badge variant={getEffortBadgeVariant(childTask.effort)} class="capitalize">
 													{childTask.effort}
@@ -1027,6 +1041,26 @@
 	.task-row {
 		position: relative; /* Needed for absolute positioning of ::before */
 		overflow: hidden; /* Keep shine contained */
+	}
+	.review-indicator {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: #3b82f6;
+		transition: all 0.2s ease;
+		margin-top: 10px;
+	}
+	
+	.review-indicator:hover {
+		opacity: 0.8;
+	}
+	
+	.from-review-task {
+		background-color: rgba(59, 130, 246, 0.08);
+	}
+	
+	.from-review-task:hover {
+		background-color: rgba(59, 130, 246, 0.12);
 	}
 </style>
 
