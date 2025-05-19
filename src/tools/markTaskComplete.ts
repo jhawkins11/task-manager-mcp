@@ -346,7 +346,7 @@ async function getNextTaskAfterCompletion(
               `[TaskServer] Sent tasks_updated notification for ${featureId} after review.`
             )
 
-            finalMessage += `\n\nAuto-review completed. Review tasks may have been added.`
+            finalMessage += `\n\nAuto-review completed. Review tasks may have been added. Run "get_next_task" to verify.`
             historyPayload.status = 'all_completed_auto_review_finished' // Update history status
             historyPayload.reviewResult = reviewResult.content[0]?.text // Log the original review result text
           } catch (dbError) {

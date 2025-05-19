@@ -45,6 +45,7 @@ export interface BreakdownOptions {
   minSubtasks?: number
   maxSubtasks?: number
   preferredEffort?: 'low' | 'medium'
+  maxRetries?: number
 }
 
 // --- Structured Output Schemas ---

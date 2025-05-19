@@ -167,11 +167,12 @@ export async function breakDownHighEffortTask(
     minSubtasks = 2,
     maxSubtasks = 5,
     preferredEffort = 'medium',
+    maxRetries = 3,
   } = options
 
-  // Message for tasks
+  // Enhanced prompt with clearer instructions for JSON output
   const breakdownPrompt = `
-Break down this high-effort **coding task** into a list of smaller, sequential, actionable coding subtasks:
+I need to break down this high-effort coding task into smaller, actionable subtasks:
 
 Task: "${taskDescription}"
 
@@ -182,68 +183,112 @@ Guidelines:
 4. The subtasks should represent a logical sequence for implementation.
 5. Only include coding tasks, not testing, documentation, or deployment steps.
 
-**IMPORTANT: Respond ONLY with a valid JSON object.** The object MUST have a single key named "subtasks". The value of "subtasks" MUST be an array of JSON objects, where each object represents a subtask and has the following keys:
-  - "description": (string) The description of the subtask.
-  - "effort": (string) The estimated effort level, MUST be either "low" or "medium".
+IMPORTANT RESPONSE FORMAT INSTRUCTIONS:
+- Return ONLY a valid JSON object
+- The JSON object MUST have a single key named "subtasks"
+- "subtasks" MUST be an array of objects with exactly two fields each:
+  - "description": string - The subtask description
+  - "effort": string - MUST be either "low" or "medium"
+- No other text before or after the JSON object
+- No markdown formatting, code blocks, or comments
 
-**Example of the exact required output format:**
+Example of EXACTLY how your response should be formatted:
 {
   "subtasks": [
-    { "description": "Subtask 1 description", "effort": "medium" },
-    { "description": "Subtask 2 description", "effort": "low" }
+    {
+      "description": "Create the database schema for user profiles",
+      "effort": "medium"
+    },
+    {
+      "description": "Implement the user profile repository class",
+      "effort": "medium"
+    }
   ]
 }
-
-Do NOT include any other text, markdown formatting, or explanations outside of this JSON object.
 `
 
-  try {
-    // Use structured response with schema validation
-    if (model instanceof OpenAI) {
-      // Use OpenRouter with structured output
-      const result = await aiService.callOpenRouterWithSchema(
-        OPENROUTER_MODEL,
-        [{ role: 'user', content: breakdownPrompt }],
-        TaskBreakdownResponseSchema,
-        { temperature: 0.5 }
+  // Function to handle the actual API call with retry logic
+  async function attemptBreakdown(attempt: number): Promise<string[]> {
+    try {
+      // Use structured response with schema validation
+      if (model instanceof OpenAI) {
+        // Use OpenRouter with structured output
+        const result = await aiService.callOpenRouterWithSchema(
+          OPENROUTER_MODEL,
+          [{ role: 'user', content: breakdownPrompt }],
+          TaskBreakdownResponseSchema,
+          { temperature: 0.2 } // Lower temperature for more consistent output
+        )
+
+        if (result.success) {
+          // Extract the descriptions from the structured response
+          return result.data.subtasks.map(
+            (subtask) => `[${subtask.effort}] ${subtask.description}`
+          )
+        } else {
+          console.warn(
+            `[TaskServer] Could not break down task using structured output (attempt ${attempt}): ${result.error}`
+          )
+
+          // Retry if attempts remain
+          if (attempt < maxRetries) {
+            logToFile(
+              `[TaskServer] Retrying task breakdown (attempt ${attempt + 1})`
+            )
+            return attemptBreakdown(attempt + 1)
+          }
+          return []
+        }
+      } else {
+        // Use Gemini with structured output
+        const result = await aiService.callGeminiWithSchema(
+          GEMINI_MODEL,
+          breakdownPrompt,
+          TaskBreakdownResponseSchema,
+          { temperature: 0.2 } // Lower temperature for more consistent output
+        )
+
+        if (result.success) {
+          // Extract the descriptions from the structured response
+          return result.data.subtasks.map(
+            (subtask) => `[${subtask.effort}] ${subtask.description}`
+          )
+        } else {
+          console.warn(
+            `[TaskServer] Could not break down task using structured output (attempt ${attempt}): ${result.error}`
+          )
+
+          // Retry if attempts remain
+          if (attempt < maxRetries) {
+            logToFile(
+              `[TaskServer] Retrying task breakdown (attempt ${attempt + 1})`
+            )
+            return attemptBreakdown(attempt + 1)
+          }
+          return []
+        }
+      }
+    } catch (error) {
+      console.error(
+        `[TaskServer] Error breaking down high-effort task (attempt ${attempt}):`,
+        error
       )
 
-      if (result.success) {
-        // Extract the descriptions from the structured response
-        return result.data.subtasks.map(
-          (subtask) => `[${subtask.effort}] ${subtask.description}`
+      // Retry if attempts remain
+      if (attempt < maxRetries) {
+        logToFile(
+          `[TaskServer] Retrying task breakdown after error (attempt ${
+            attempt + 1
+          })`
         )
-      } else {
-        console.warn(
-          `[TaskServer] Could not break down task using structured output: ${result.error}`
-        )
-        return []
+        return attemptBreakdown(attempt + 1)
       }
-    } else {
-      // Use Gemini with structured output
-      const result = await aiService.callGeminiWithSchema(
-        GEMINI_MODEL,
-        breakdownPrompt,
-        TaskBreakdownResponseSchema,
-        { temperature: 0.5 }
-      )
-
-      if (result.success) {
-        // Extract the descriptions from the structured response
-        return result.data.subtasks.map(
-          (subtask) => `[${subtask.effort}] ${subtask.description}`
-        )
-      } else {
-        console.warn(
-          `[TaskServer] Could not break down task using structured output: ${result.error}`
-        )
-        return []
-      }
+      return []
     }
-  } catch (error) {
-    console.error('[TaskServer] Error breaking down high-effort task:', error)
-    return []
   }
+
+  // Start the breakdown process with first attempt
+  return attemptBreakdown(1)
 }
 
 /**
@@ -311,15 +356,19 @@ function robustJsonParse(text: string): any {
     )
 
     try {
+      // Detect the main expected structure type (tasks vs subtasks)
+      const isTasksArray = text.includes('"tasks"')
+      const isSubtasksArray = text.includes('"subtasks"')
+      const hasDescription = text.includes('"description"')
+      const hasEffort = text.includes('"effort"')
+
       // Special handling for common OpenRouter/AI model response patterns
-      if (
-        text.includes('"tasks"') &&
-        text.includes('"description"') &&
-        text.includes('"effort"')
-      ) {
-        // 1. Extract all individual task objects as best as we can
+      if ((isTasksArray || isSubtasksArray) && hasDescription && hasEffort) {
+        const arrayKey = isSubtasksArray ? 'subtasks' : 'tasks'
+
+        // 1. Enhanced regex that works for both tasks and subtasks arrays
         const taskRegex =
-          /"description"\s*:\s*"((?:[^"\\]|\\"|\\)*)"\s*,\s*"effort"\s*:\s*"(low|medium|high)"/g
+          /"description"\s*:\s*"((?:[^"\\]|\\"|\\|[\s\S])*?)"\s*,\s*"effort"\s*:\s*"(low|medium|high)"/g
         const tasks = []
         let match
 
@@ -338,13 +387,43 @@ function robustJsonParse(text: string): any {
 
         if (tasks.length > 0) {
           logToFile(
-            `[robustJsonParse] Successfully extracted ${tasks.length} tasks with regex`
+            `[robustJsonParse] Successfully extracted ${tasks.length} ${arrayKey} with regex`
           )
-          return { tasks }
+          return { [arrayKey]: tasks }
+        }
+
+        // 2. If regex extraction fails, try extracting JSON objects directly
+        if (tasks.length === 0) {
+          try {
+            const objectsExtracted = extractJSONObjects(text)
+            if (objectsExtracted.length > 0) {
+              // Filter valid task objects
+              const validTasks = objectsExtracted.filter(
+                (obj) =>
+                  obj &&
+                  typeof obj === 'object' &&
+                  obj.description &&
+                  obj.effort &&
+                  typeof obj.description === 'string' &&
+                  typeof obj.effort === 'string'
+              )
+
+              if (validTasks.length > 0) {
+                logToFile(
+                  `[robustJsonParse] Successfully extracted ${validTasks.length} ${arrayKey} with object extraction`
+                )
+                return { [arrayKey]: validTasks }
+              }
+            }
+          } catch (objExtractionError) {
+            logToFile(
+              `[robustJsonParse] Object extraction failed: ${objExtractionError}`
+            )
+          }
         }
       }
 
-      // 2. Fall back to manual line-by-line parsing for JSON objects
+      // 3. Fall back to manual line-by-line parsing for JSON objects
       const lines = text.split('\n')
       let cleanJson = ''
       let inString = false
@@ -363,6 +442,9 @@ function robustJsonParse(text: string): any {
         cleanJson += inString ? ' ' + processedLine : processedLine
       }
 
+      // 4. Balance braces and brackets if needed
+      cleanJson = balanceBracesAndBrackets(cleanJson)
+
       // Final attempt to parse the cleaned JSON
       return JSON.parse(cleanJson)
     } catch (recoveryError) {
@@ -372,6 +454,97 @@ function robustJsonParse(text: string): any {
       throw new Error(`Failed to parse JSON: ${error.message}`)
     }
   }
+}
+
+/**
+ * Extracts valid JSON objects from a potentially malformed string.
+ * Helps recover objects from truncated or malformed JSON.
+ */
+function extractJSONObjects(text: string): any[] {
+  const objects: any[] = []
+
+  // First try to find array boundaries
+  const arrayStartIndex = text.indexOf('[')
+  const arrayEndIndex = text.lastIndexOf(']')
+
+  if (arrayStartIndex !== -1 && arrayEndIndex > arrayStartIndex) {
+    // Extract array content
+    const arrayContent = text.substring(arrayStartIndex + 1, arrayEndIndex)
+
+    // Split by potential object boundaries, respecting nested objects
+    let depth = 0
+    let currentObject = ''
+    let inString = false
+
+    for (let i = 0; i < arrayContent.length; i++) {
+      const char = arrayContent[i]
+
+      // Track string boundaries
+      if (char === '"' && (i === 0 || arrayContent[i - 1] !== '\\')) {
+        inString = !inString
+      }
+
+      // Only track structure when not in a string
+      if (!inString) {
+        if (char === '{') {
+          depth++
+          if (depth === 1) {
+            // Start of a new object
+            currentObject = '{'
+            continue
+          }
+        } else if (char === '}') {
+          depth--
+          if (depth === 0) {
+            // End of an object, try to parse it
+            currentObject += '}'
+            try {
+              const obj = JSON.parse(currentObject)
+              objects.push(obj)
+            } catch (e) {
+              // If this object can't be parsed, just continue
+            }
+            currentObject = ''
+            continue
+          }
+        } else if (char === ',' && depth === 0) {
+          // Skip commas between objects
+          continue
+        }
+      }
+
+      // Add character to current object if we're inside one
+      if (depth > 0) {
+        currentObject += char
+      }
+    }
+  }
+
+  return objects
+}
+
+/**
+ * Balances braces and brackets in a JSON string to make it valid
+ */
+function balanceBracesAndBrackets(text: string): string {
+  let result = text
+
+  // Count opening and closing braces/brackets
+  const openBraces = (result.match(/\{/g) || []).length
+  const closeBraces = (result.match(/\}/g) || []).length
+  const openBrackets = (result.match(/\[/g) || []).length
+  const closeBrackets = (result.match(/\]/g) || []).length
+
+  // Add missing closing braces/brackets
+  if (openBraces > closeBraces) {
+    result += '}'.repeat(openBraces - closeBraces)
+  }
+
+  if (openBrackets > closeBrackets) {
+    result += ']'.repeat(openBrackets - closeBrackets)
+  }
+
+  return result
 }
 
 /**
@@ -430,7 +603,13 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
     return text.trim()
   }
   jsonString = extractJsonFromText(jsonString)
-  // --- End cleaning ---
+
+  // Try to identify expected content type for better recovery
+  const expectsSubtasks =
+    responseText.includes('"subtasks"') || responseText.includes('subtasks')
+
+  const expectsTasks =
+    responseText.includes('"tasks"') || responseText.includes('tasks')
 
   // --- Auto-fix common JSON issues (trailing commas, comments) ---
   function fixCommonJsonIssues(text: string): string {
@@ -451,6 +630,19 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
     const closeBraces = (text.match(/\}/g) || []).length
     if (openBraces > closeBraces) {
       text = text + '}'.repeat(openBraces - closeBraces)
+    }
+
+    // Fix unclosed quotes at end of string
+    if ((text.match(/"/g) || []).length % 2 !== 0) {
+      // Check if the last quote is an opening quote (likely in the middle of a string)
+      const lastQuotePos = text.lastIndexOf('"')
+      const endsWithOpenQuote =
+        lastQuotePos !== -1 &&
+        text.substring(lastQuotePos).split('"').length === 2
+
+      if (endsWithOpenQuote) {
+        text = text + '"'
+      }
     }
 
     return text
@@ -477,6 +669,85 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
       `[parseAndValidateJsonResponse] JSON parsed successfully with robust parser`
     )
   } catch (parseError) {
+    // If primary parsing failed, try reconstructing specific expected structures
+    try {
+      // For tasks/subtasks, try to reconstruct using direct object extraction
+      if (expectsTasks || expectsSubtasks) {
+        const arrayKey = expectsSubtasks ? 'subtasks' : 'tasks'
+
+        // Extract task objects directly from text
+        const extractedObjects = extractJSONObjects(jsonString)
+        if (extractedObjects.length > 0) {
+          // Filter out invalid objects
+          const validItems = extractedObjects.filter(
+            (obj) =>
+              obj &&
+              typeof obj === 'object' &&
+              obj.description &&
+              obj.effort &&
+              typeof obj.description === 'string' &&
+              typeof obj.effort === 'string'
+          )
+
+          if (validItems.length > 0) {
+            parsedData = { [arrayKey]: validItems }
+            logToFile(
+              `[parseAndValidateJsonResponse] Successfully reconstructed ${arrayKey} array with ${validItems.length} items`
+            )
+
+            // Validate against schema immediately
+            const validationResult = schema.safeParse(parsedData)
+            if (validationResult.success) {
+              return {
+                success: true,
+                data: validationResult.data,
+              }
+            }
+          }
+        }
+
+        // If we can see where tasks are, try regex extraction
+        const regex = new RegExp(
+          `"(description|desc|name)"\\s*:\\s*"([^"]*)"[\\s\\S]*?"(effort|difficulty)"\\s*:\\s*"(low|medium|high)"`,
+          'gi'
+        )
+
+        const items = []
+        let match
+        while ((match = regex.exec(responseText)) !== null) {
+          try {
+            items.push({
+              description: match[2],
+              effort: match[4].toLowerCase(),
+            })
+          } catch (e) {
+            // Skip invalid matches
+          }
+        }
+
+        if (items.length > 0) {
+          parsedData = { [arrayKey]: items }
+          logToFile(
+            `[parseAndValidateJsonResponse] Successfully extracted ${items.length} ${arrayKey} with regex`
+          )
+
+          // Validate against schema
+          const validationResult = schema.safeParse(parsedData)
+          if (validationResult.success) {
+            return {
+              success: true,
+              data: validationResult.data,
+            }
+          }
+        }
+      }
+    } catch (reconstructionError) {
+      logToFile(
+        `[parseAndValidateJsonResponse] Reconstruction error: ${reconstructionError}`
+      )
+      // Continue to normal error handling
+    }
+
     // All parsing methods have failed
     logToFile(
       `[parseAndValidateJsonResponse] All parsing attempts failed: ${parseError}`
@@ -497,48 +768,35 @@ export function parseAndValidateJsonResponse<T extends z.ZodType>(
       data: validationResult.data,
     }
   } else {
-    // Enhanced logging for schema validation errors
-    try {
-      logToFile(
-        `[parseAndValidateJsonResponse] Schema validation failed. Errors: ${JSON.stringify(
-          validationResult.error.errors
-        )} | Parsed data: ${JSON.stringify(parsedData)?.substring(0, 1000)}`
-      )
+    logToFile(
+      `[parseAndValidateJsonResponse] Schema validation failed. Errors: ${JSON.stringify(
+        validationResult.error.errors
+      )}`
+    )
 
-      // Try to recover partial response if possible
-      const recoveredData = attemptPartialResponseRecovery(parsedData, schema)
-      if (recoveredData) {
-        logToFile(
-          `[parseAndValidateJsonResponse] Successfully recovered partial response`
-        )
-        return {
-          success: true,
-          data: recoveredData,
-        }
+    // Attempt to recover partial valid data
+    const recoveredData = attemptPartialResponseRecovery(parsedData, schema)
+    if (recoveredData) {
+      logToFile(
+        `[parseAndValidateJsonResponse] Successfully recovered partial response`
+      )
+      return {
+        success: true,
+        data: recoveredData,
       }
-    } catch (logError) {
-      // Ignore logging errors
     }
-    // Format Zod errors into a more readable string
-    const formattedErrors = validationResult.error.errors
-      .map((err) => `${err.path.join('.')}: ${err.message}`)
-      .join('; ')
 
     return {
       success: false,
-      error: `Schema validation failed: ${formattedErrors}`,
+      error: `Schema validation failed: ${validationResult.error.message}`,
       rawData: parsedData,
     }
   }
 }
 
 /**
- * Attempts to recover a partial JSON response when schema validation fails.
- * Useful for handling truncated responses from models.
- *
- * @param parsedData The parsed but invalid JSON data
- * @param schema The Zod schema to validate against
- * @returns Recovered data that passes validation, or null if recovery failed
+ * Attempts to recover partial valid data from a failed schema validation.
+ * Particularly useful for array of tasks or subtasks where some items might be valid.
  */
 function attemptPartialResponseRecovery(
   parsedData: any,
@@ -546,29 +804,38 @@ function attemptPartialResponseRecovery(
 ): any | null {
   try {
     logToFile(
-      `[attemptPartialResponseRecovery] Attempting recovery of partial JSON response`
+      `[attemptPartialResponseRecovery] Attempting to recover partial valid response`
     )
 
     // Handle common case: tasks array with valid and invalid items
-    if (parsedData && parsedData.tasks && Array.isArray(parsedData.tasks)) {
+    if (
+      parsedData &&
+      ((parsedData.tasks && Array.isArray(parsedData.tasks)) ||
+        (parsedData.subtasks && Array.isArray(parsedData.subtasks)))
+    ) {
+      const isSubtasksArray =
+        parsedData.subtasks && Array.isArray(parsedData.subtasks)
+      const arrayKey = isSubtasksArray ? 'subtasks' : 'tasks'
+      const items = isSubtasksArray ? parsedData.subtasks : parsedData.tasks
+
       // Filter out invalid task items
-      const validTasks = parsedData.tasks.filter(
-        (task: any) =>
-          task &&
-          typeof task === 'object' &&
-          task.description &&
-          task.effort &&
-          typeof task.description === 'string' &&
-          typeof task.effort === 'string'
+      const validItems = items.filter(
+        (item: any) =>
+          item &&
+          typeof item === 'object' &&
+          item.description &&
+          item.effort &&
+          typeof item.description === 'string' &&
+          typeof item.effort === 'string'
       )
 
-      if (validTasks.length > 0) {
-        const recoveredData = { ...parsedData, tasks: validTasks }
+      if (validItems.length > 0) {
+        const recoveredData = { ...parsedData, [arrayKey]: validItems }
         const validationResult = schema.safeParse(recoveredData)
 
         if (validationResult.success) {
           logToFile(
-            `[attemptPartialResponseRecovery] Recovery successful, found ${validTasks.length} valid tasks`
+            `[attemptPartialResponseRecovery] Recovery successful, found ${validItems.length} valid ${arrayKey}`
           )
           return validationResult.data
         }
@@ -628,7 +895,8 @@ export async function ensureEffortRatings(
 export async function processAndBreakdownTasks(
   initialTasksWithEffort: string[],
   model: GenerativeModel | OpenAI | null,
-  featureId: string
+  featureId: string,
+  fromReviewContext: boolean
 ): Promise<{ finalTasks: Task[]; complexTaskMap: Map<string, string> }> {
   const finalProcessedSteps: string[] = []
   const complexTaskMap = new Map<string, string>()
@@ -747,17 +1015,20 @@ export async function processAndBreakdownTasks(
       // If it's a parent container, set status to 'decomposed', otherwise 'pending'
       const status = isParentContainer ? 'decomposed' : 'pending'
 
-      const taskData = {
+      const taskDataToValidate: Omit<
+        Task,
+        'title' | 'subTasks' | 'dependencies' | 'history' | 'isManual'
+      > = {
         id: taskId,
         feature_id: featureId,
         status,
         description: cleanDescription,
         effort: validatedEffort,
-        // Decomposed tasks are not considered 'completed' in the traditional sense
-        completed: false,
+        completed: false, // All new tasks/subtasks start as not completed.
         ...(parentTaskId && { parentTaskId }),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        ...(fromReviewContext && { fromReview: true }), // Set fromReview if in review context
       }
 
       // --- Enhanced Logging ---
@@ -770,13 +1041,13 @@ export async function processAndBreakdownTasks(
       )
       logToFile(
         `[processAndBreakdownTasks] Task data before validation: ${JSON.stringify(
-          taskData
+          taskDataToValidate
         )}`
       )
       // --- End Enhanced Logging ---
 
       // Validate against the Task schema before pushing
-      const validationResult = TaskSchema.safeParse(taskData)
+      const validationResult = TaskSchema.safeParse(taskDataToValidate)
       if (validationResult.success) {
         // --- Enhanced Logging ---
         logToFile(
@@ -864,18 +1135,29 @@ export async function processAndFinalizePlan(
   const complexTaskMap = new Map<string, string>() // To track original description of broken down tasks
 
   try {
-    // 1. Ensure all raw steps have effort ratings
+    // 1. Ensure all raw steps have effort ratings.
+    // ensureEffortRatings preserves existing [high] prefixes from rawPlanSteps
+    // and assigns effort to those without a prefix.
     const initialTasksWithEffort = await ensureEffortRatings(
       rawPlanSteps,
       model
     )
 
-    // 2. Process tasks: Breakdown high-effort ones
+    // Explicitly define the tasks to be sent for breakdown processing.
+    // This includes tasks from rawPlanSteps that were marked [high]
+    // (as ensureEffortRatings preserves such tags) and will be
+    // unconditionally processed by processAndBreakdownTasks.
+    const tasksForBreakdownProcessing = initialTasksWithEffort
+
+    // 2. Process tasks: Breakdown high-effort ones.
+    // processAndBreakdownTasks will identify and attempt to break down tasks
+    // with a "[high]" prefix within tasksForBreakdownProcessing.
     const { finalTasks: processedTasks, complexTaskMap: breakdownMap } =
       await processAndBreakdownTasks(
-        initialTasksWithEffort,
+        tasksForBreakdownProcessing, // Using the explicitly defined variable
         model,
-        featureId // Pass featureId for logging/history
+        featureId, // Pass featureId for logging/history
+        fromReview // Pass the fromReview context flag
       )
 
     // Merge complexTaskMap from breakdown
@@ -922,6 +1204,9 @@ export async function processAndFinalizePlan(
         if (fromReview && !existing.fromReview) {
           // Use camelCase here as Task type expects it, DB service handles conversion to snake_case
           updates.fromReview = true
+          await logToFile(
+            `[processAndFinalizePlan] Updating task ${existing.id} to set fromReview = true. Context fromReview: ${fromReview}, existing.fromReview: ${existing.fromReview}`
+          )
         }
 
         // Check if any updates are needed using the keys in the updates object
@@ -998,15 +1283,35 @@ export async function processAndFinalizePlan(
           task.updatedAt && typeof task.updatedAt === 'number'
             ? Math.floor(new Date(task.updatedAt * 1000).getTime() / 1000)
             : now, // Map and convert
-        from_review: fromReview || task.fromReview ? 1 : 0, // Convert camelCase to snake_case for DB
+        // Use camelCase 'fromReview' to align with the Task interface expected by addTask
+        fromReview: fromReview || task.fromReview || false,
       }
+      await logToFile(
+        `[processAndFinalizePlan] Adding task ${task.id}. Context fromReview: ${fromReview}, task.fromReview property: ${task.fromReview}, dbTaskPayload.fromReview value: ${dbTaskPayload.fromReview}`,
+        'debug'
+      )
 
-      // Only add parent_task_id if it exists and is not null
-      if (task.parentTaskId !== null && task.parentTaskId !== undefined) {
-        dbTaskPayload.parent_task_id = task.parentTaskId
+      try {
+        // Ensure that the object passed to addTask conforms to the Task interface
+        await databaseService.addTask({
+          id: dbTaskPayload.id,
+          title: dbTaskPayload.title,
+          description: dbTaskPayload.description,
+          status: dbTaskPayload.status,
+          completed: dbTaskPayload.completed === 1, // Ensure boolean
+          effort: dbTaskPayload.effort,
+          feature_id: dbTaskPayload.feature_id,
+          created_at: dbTaskPayload.created_at,
+          updated_at: dbTaskPayload.updated_at,
+          fromReview: dbTaskPayload.fromReview, // This is now correctly camelCased
+        })
+      } catch (dbError) {
+        logToFile(
+          `[processAndFinalizePlan] Error adding task to database: ${dbError}`
+        )
+        console.error(`[TaskServer] Error adding task to database:`, dbError)
+        throw dbError
       }
-
-      await databaseService.addTask(dbTaskPayload)
     }
 
     for (const taskId of taskIdsToDelete) {
@@ -1043,10 +1348,19 @@ export async function processAndFinalizePlan(
   // 7. Notify UI about the updated tasks (outside the main try/catch for DB ops)
   try {
     // Add detailed logging to debug
-    console.log(
-      'Full task structure sample:',
-      JSON.stringify(finalTasks[0], null, 2)
-    )
+    if (finalTasks.length > 0) {
+      await logToFile(
+        `[processAndFinalizePlan] Sample of final task from DB (finalTasks[0]): ${JSON.stringify(
+          finalTasks[0],
+          null,
+          2
+        )}`
+      )
+    } else {
+      await logToFile(
+        `[processAndFinalizePlan] No final tasks to log from DB sample.`
+      )
+    }
 
     const formattedTasks = finalTasks.map((task: any) => {
       // Create a clean task object for the WebSocket
@@ -1071,10 +1385,21 @@ export async function processAndFinalizePlan(
     })
 
     // Log the first formatted task
-    console.log(
-      'First formatted task for WebSocket:',
-      JSON.stringify(formattedTasks[0], null, 2)
-    )
+    if (formattedTasks.length > 0) {
+      await logToFile(
+        `[processAndFinalizePlan] First formatted task for WebSocket (formattedTasks[0]): ${JSON.stringify(
+          formattedTasks[0],
+          null,
+          2
+        )}`,
+        'debug'
+      )
+    } else {
+      await logToFile(
+        `[processAndFinalizePlan] No formatted tasks to log for WebSocket sample.`,
+        'debug'
+      )
+    }
 
     webSocketService.notifyTasksUpdated(featureId, formattedTasks)
     logToFile(`[processAndFinalizePlan] WebSocket notification sent.`)
