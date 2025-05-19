@@ -7,7 +7,8 @@
     "build:server": "tsc && mkdir -p dist/config && cp src/config/*.sql dist/config/",
     "build:frontend": "cd frontend && npm run build && cd .. && mkdir -p dist/frontend-ui && cp -r frontend/build/* dist/frontend-ui/",
     "start": "node dist/server.js",
-    "dev": "nodemon --watch src --ext ts --exec ts-node src/server.ts"
+    "dev": "nodemon --watch src --ext ts --exec ts-node src/server.ts",
+    "test": "jest"
   },
   "keywords": [],
   "author": "",
@@ -33,9 +34,12 @@
   "devDependencies": {
     "@sveltejs/adapter-auto": "^6.0.0",
     "@sveltejs/kit": "^2.20.7",
+    "@types/jest": "^29.5.14",
     "@types/node": "^22.14.1",
     "@types/ws": "^8.5.10",
+    "jest": "^29.7.0",
     "nodemon": "^3.1.9",
+    "ts-jest": "^29.3.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
   }
