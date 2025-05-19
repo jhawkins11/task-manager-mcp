@@ -689,11 +689,15 @@ class DatabaseService {
     try {
       const now = Math.floor(Date.now() / 1000)
 
+      await this.connect()
+
       await this.runAsync(
         `INSERT INTO features (id, description, project_path, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?)`,
         [id, description, projectPath, now, now]
       )
+
+      await this.close()
 
       return { id, description, project_path: projectPath }
     } catch (error) {
