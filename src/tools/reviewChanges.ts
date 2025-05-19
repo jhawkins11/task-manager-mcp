@@ -73,6 +73,7 @@ export async function handleReviewChanges(
   }
 
   let targetDir = process.cwd()
+
   if (project_path) {
     // Basic check for path traversal characters
     if (project_path.includes('..') || project_path.includes('~')) {
@@ -562,9 +563,8 @@ Do NOT include summaries, commentary, or anything outside this JSON structure. D
         )
       }
 
-      // Return the standardized response object, serialized
       return {
-        content: [{ type: 'text', text: JSON.stringify(responseData) }],
+        content: [{ type: 'text', text: responseData.message }],
         isError: false,
       }
     } catch (error: any) {
