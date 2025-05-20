@@ -30,11 +30,15 @@
 	// Question modal state
 	let showQuestionModal = false;
 	let questionData: ShowQuestionPayload | null = null;
+	let selectedOption = '';
+	let userResponse = '';
 
 	// Task form modal state
 	let showTaskFormModal = false;
 	let editingTask: Task | null = null;
 	let isEditing = false;
+
+	let waitingOnLLM = false;
 
 	// Reactive statement to update nestedTasks when tasks store changes
 	$: {
@@ -99,6 +103,7 @@
 
 				switch (message.type) {
 					case 'tasks_updated':
+						waitingOnLLM = false;
 						console.log(`[WS Client] Received tasks_updated for feature ${featureId}:`, message.payload.tasks);
 						if (message.payload?.tasks && Array.isArray(message.payload.tasks) && featureId) {
 							// Map incoming tasks using the helper function to ensure consistency
@@ -146,6 +151,7 @@
 						}
 						break;
 					case 'show_question':
+						waitingOnLLM = false;
 						console.log('[WS Client] Received clarification question:', message.payload);
 						// Store question data and show modal
 						questionData = message.payload as ShowQuestionPayload;
@@ -154,6 +160,7 @@
 						loading.set(false);
 						break;
 					case 'error':
+						waitingOnLLM = false;
 						console.error('[WS Client] Received error message:', message.payload);
 						// Display user-facing error
 						error.set(message.payload?.message || 'Received error from server.');
@@ -647,24 +654,29 @@
 	}
 
 	// Handle user response to clarification question
-	function handleQuestionResponse(event: CustomEvent) {
-		const response = event.detail;
-		console.log('[WS Client] User responded to question:', response);
+	function handleQuestionResponse(event: SubmitEvent) {
+		event.preventDefault();
+		console.log('[WS Client] User responded to question. Selected:', selectedOption, 'Text:', userResponse);
 		
 		if (questionData && featureId) {
-			// Send the response back to the server
+			const response = selectedOption || userResponse;
+			
 			sendWsMessage({
-				type: 'question_response', 
+				type: 'question_response',
 				featureId,
 				payload: {
 					questionId: questionData.questionId,
-					response: response.response
+					response: response
 				} as QuestionResponsePayload
 			});
 			
-			// Reset modal state
 			showQuestionModal = false;
 			questionData = null;
+			waitingOnLLM = true;
+			
+			// Reset form fields
+			selectedOption = '';
+			userResponse = '';
 		}
 	}
 
@@ -760,7 +772,60 @@
 		{/if}
 	</div>
 
-	{#if $loading}
+	{#if questionData}
+		<div class="flex flex-col items-center justify-center min-h-[300px]">
+			<div class="max-w-md w-full bg-background border border-border rounded-lg shadow-lg p-6">
+				<h2 class="text-xl font-semibold mb-4">Clarification Needed</h2>
+				<p class="text-foreground mb-5">{questionData.question}</p>
+				<form on:submit|preventDefault={handleQuestionResponse}>
+					{#if questionData.options && questionData.options.length > 0}
+						<div class="flex flex-col gap-3 mb-5">
+							{#each questionData.options as option}
+								<label class="flex items-center gap-2 p-3 border border-border rounded-md cursor-pointer hover:bg-muted transition-colors">
+									<input 
+										type="radio" 
+										name="option" 
+										value={option}
+										bind:group={selectedOption}
+										class="focus:ring-primary"
+									/>
+									<span class="text-foreground">{option}</span>
+								</label>
+							{/each}
+						</div>
+					{/if}
+					{#if questionData.allowsText !== false}
+						<div class="mb-5">
+							<label for="text-response" class="block mb-2 font-medium text-foreground">
+								{questionData.options && questionData.options.length > 0 ? 'Or provide a custom response:' : 'Your response:'}
+							</label>
+							<textarea 
+								id="text-response"
+								rows="3"
+								bind:value={userResponse}
+								placeholder="Type your response here..."
+								class="w-full p-3 border border-border rounded-md resize-y text-foreground bg-background focus:ring-primary focus:border-primary"
+							></textarea>
+						</div>
+					{/if}
+					<div class="flex justify-end gap-3 pt-2">
+						<button 
+							type="submit" 
+							class="bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 rounded-md font-medium text-sm disabled:opacity-50"
+							disabled={!userResponse && (!questionData.options || !selectedOption)}
+						>
+							Submit Response
+						</button>
+					</div>
+				</form>
+			</div>
+		</div>
+	{:else if waitingOnLLM}
+		<div class="flex flex-col items-center justify-center min-h-[300px]">
+			<Loader2 class="h-12 w-12 animate-spin text-primary mb-4" />
+			<p class="text-lg text-muted-foreground">Waiting on LLM to plan after clarification...</p>
+		</div>
+	{:else if $loading}
 		<div class="flex justify-center items-center h-64">
 			<Loader2 class="h-12 w-12 animate-spin text-primary" />
 		</div>
@@ -976,18 +1041,6 @@
 				</div>
 			</CardFooter>
 		</Card>
-	{/if}
-
-	{#if questionData}
-		<QuestionModal
-			open={showQuestionModal}
-			questionId={questionData.questionId}
-			question={questionData.question}
-			options={questionData.options || []}
-			allowsText={questionData.allowsText !== false}
-			on:response={handleQuestionResponse}
-			on:cancel={handleQuestionCancel}
-		/>
 	{/if}
 
 	{#if featureId}
