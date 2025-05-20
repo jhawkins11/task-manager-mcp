@@ -104,7 +104,13 @@ server.tool(
       }
 
       // Embed ID, description, effort, and parent info in the text message
-      const message = `Next pending task (ID: ${nextTask.id})${effortInfo}${parentInfo}: ${nextTask.description}`
+      const message = `Next pending task (ID: ${
+        nextTask.id
+      })${effortInfo}${parentInfo}: ${
+        nextTask.title !== nextTask.description
+          ? `${nextTask.title}: ${nextTask.description}`
+          : nextTask.description
+      }`
 
       await logToFile(`[TaskServer] Found next task: ${nextTask.id}`)
 
