@@ -78,7 +78,7 @@ If running manually (not via Cursor), create a .env file in the project root for
 
 # Get key: https://openrouter.ai/keys
 OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-OPENROUTER_MODEL=google/gemini-2.5-pro-preview
+OPENROUTER_MODEL=google/gemini-2.5-flash-preview:thinking
 FALLBACK_OPENROUTER_MODEL=google/gemini-2.5-flash-preview:thinking
 
 # === Google AI API (Alternative) ===
@@ -101,13 +101,13 @@ AUTO_REVIEW_ON_COMPLETION=false
 
 **IMPORTANT:** It's highly recommended to integrate your own Google AI API key to OpenRouter to avoid the free models' rate limits. See below.
 
-**Using OpenRouter's Free Tiers:** You can significantly minimize or eliminate costs by using models marked as "Free" on OpenRouter (like google/gemini-2.5-pro-preview at the time of writing) while connecting your own Google AI API key. Check out this reddit thread for more info: https://www.reddit.com/r/ChatGPTCoding/comments/1jrp1tj/a_simple_guide_to_setting_up_gemini_25_pro_free/
+**Using OpenRouter's Free Tiers:** You can significantly minimize or eliminate costs by using models marked as "Free" on OpenRouter (like google/gemini-2.5-flash-preview:thinking at the time of writing) while connecting your own Google AI API key. Check out this reddit thread for more info: https://www.reddit.com/r/ChatGPTCoding/comments/1jrp1tj/a_simple_guide_to_setting_up_gemini_25_pro_free/
 
 **Fallback Costs:** The server automatically retries with a fallback model if the primary hits a rate limit. The default fallback (FALLBACK_OPENROUTER_MODEL) is often a faster/cheaper model like Gemini Flash, which might still have associated costs depending on OpenRouter's current pricing/tiers. Check their site and adjust the fallback model in your configuration if needed.
 
 ## Usage with Cursor (Task Manager Mode)
 
-This is the primary way this server is intended to be used.
+This is the primary way this server is intended to be used. I have not yet tested it with other AI code editors yet. If you try it, please let me know how it goes, and I'll update the README.
 
 ### 1. Configure the MCP Server in Cursor:
 
@@ -129,7 +129,7 @@ Add the following entry to the mcpServers object within that JSON file:
       "env": {
         "OPENROUTER_API_KEY": "sk-or-v1-xxxxxxxxxxxxxxxxxxxx"
         //   optional: my recommended model for MCP is Gemini 2.5 Pro Free which is already set by default
-        //   "OPENROUTER_MODEL": "google/gemini-2.5-pro-preview",
+        //   "OPENROUTER_MODEL": "google/gemini-2.5-flash-preview:thinking",
         //   also optional
         //   "FALLBACK_OPENROUTER_MODEL": "google/gemini-2.5-flash-preview:thinking",
         //   optional: the default port for the UI is 4999 if not set
