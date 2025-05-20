@@ -15,6 +15,7 @@
 	import type { Selected } from 'bits-ui';
 	import QuestionModal from '$lib/components/QuestionModal.svelte';
 	import TaskFormModal from '$lib/components/TaskFormModal.svelte';
+	import ImportTasksModal from '$lib/components/ImportTasksModal.svelte';
 
 	// Convert to writable stores for better state management
 	const tasks: Writable<Task[]> = writable([]);
@@ -39,6 +40,8 @@
 	let isEditing = false;
 
 	let waitingOnLLM = false;
+
+	let showImportModal = false;
 
 	// Reactive statement to update nestedTasks when tasks store changes
 	$: {
@@ -744,6 +747,23 @@
 		} as Task;
 	}
 
+	async function handleImportTasks(event: CustomEvent) {
+		const { tasks } = event.detail;
+		if (!Array.isArray(tasks)) return;
+		for (const t of tasks) {
+			await addTask({
+				title: t.title,
+				effort: t.effort,
+				featureId: featureId || ''
+			});
+		}
+		showImportModal = false;
+	}
+
+	function handleCancelImport() {
+		showImportModal = false;
+	}
+
 </script>
 
 <div class="container mx-auto py-10 px-4 sm:px-6 lg:px-8 max-w-5xl">
@@ -840,8 +860,11 @@
 		<Card class="shadow-lg">
 			<CardHeader class="border-b border-border px-6 py-4">
 				<CardTitle class="text-xl font-semibold flex justify-between items-center">
-					<span>Tasks</span>
-					<Badge variant="secondary">{$tasks.length}</Badge>
+					<span class="flex-1">Tasks</span>
+					<div class="flex justify-between items-center gap-4 items-center">
+						<Badge variant="secondary">{$tasks.length}</Badge>
+						<Button on:click={() => showImportModal = true}>Import Tasks</Button>
+					</div>
 				</CardTitle>
 				<CardDescription class="mt-1">
 					Manage your tasks and track progress for the selected feature.
@@ -1061,6 +1084,13 @@
 			on:cancel={() => showTaskFormModal = false}
 		/>
 	{/if}
+
+	
+	<ImportTasksModal
+		bind:open={showImportModal}
+		on:import={handleImportTasks}
+		on:cancel={handleCancelImport}
+	/>
 </div>
 
 <style>
