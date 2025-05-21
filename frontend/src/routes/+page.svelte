@@ -396,7 +396,7 @@
 		nestedTasks = rootTasks;
 	}
 
-	async function addTask(taskData: { title: string; effort: string; featureId: string }) {
+	async function addTask(taskData: { title: string; effort: string; featureId: string, description?: string }) {
 		try {
 			const response = await fetch('/api/tasks', {
 				method: 'POST',
@@ -405,7 +405,7 @@
 				},
 				body: JSON.stringify({
 					...taskData,
-					description: taskData.title // Use title as description
+					description: taskData.description || taskData.title // Use provided description, or title if none
 				})
 			});
 
@@ -754,7 +754,8 @@
 			await addTask({
 				title: t.title,
 				effort: t.effort,
-				featureId: featureId || ''
+				featureId: featureId || '',
+				description: t.description 
 			});
 		}
 		showImportModal = false;
