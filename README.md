@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/jhawkins11-task-manager-mcp-badge.png)](https://mseep.ai/app/jhawkins11-task-manager-mcp)
+
 # Task Manager MCP Server
 
 This is an MCP server built to integrate with AI code editors like Cursor. The main goal here is to maximize Cursor's agentic capabilities and Gemini 2.5's excellent architecting capabilities while working around Cursor's extremely limited context window. This was inspired largely by Roo Code's Boomerang mode, but I found it extremely expensive as the only model that works with it's apply bot is Claude 3.7 Sonnet. With this server, you get the best of both worlds: unlimited context window and unlimited usage for the price of Cursor's $20/month subscription.
